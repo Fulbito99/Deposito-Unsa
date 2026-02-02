@@ -1,0 +1,400 @@
+
+import React, { useState, useEffect, useMemo } from 'react';
+import {
+  LayoutDashboard,
+  Warehouse,
+  Store,
+  History,
+  ArrowRightLeft,
+  AlertCircle,
+  Package,
+  Search,
+  Boxes,
+  ArrowUpRight,
+  Layers,
+  MoreVertical,
+  ChevronRight,
+  X,
+  Edit2,
+  Trash2,
+  Menu,
+  Plus,
+  Download,
+  Upload,
+  Settings,
+  Calendar,
+  AlertTriangle,
+  MapPin,
+  TrendingUp,
+  BarChart3,
+  PieChart as PieChartIcon
+} from 'lucide-react';
+import { Product, Locale, Transfer, ViewType } from './types';
+import { INITIAL_PRODUCTS, LOCALES } from './constants';
+import { db } from './firebase';
+import {
+  collection,
+  onSnapshot,
+  doc,
+  setDoc,
+  deleteDoc,
+  updateDoc,
+  query,
+  orderBy,
+  writeBatch
+} from 'firebase/firestore';
+import {
+  Wifi,
+  WifiOff,
+  Cloud,
+  Smartphone,
+  CheckCircle2,
+  LogOut,
+  User
+} from 'lucide-react';
+import { auth, googleProvider } from './firebase';
+import jsPDF from 'jspdf';
+import autoTable from 'jspdf-autotable';
+import { signInWithPopup, signOut, User as FirebaseUser } from 'firebase/auth';
+import {
+  BarChart,
+  Bar,
+  PieChart,
+  Pie,
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+  ResponsiveContainer,
+  Cell
+} from 'recharts';
+
+// --- Reusable UI Components ---
+
+const SidebarItem: React.FC<{
+  icon: React.ReactNode;
+  label: string;
+  active: boolean;
+  onClick: () => void
+}> = ({ icon, label, active, onClick }) => (
+  <button
+    onClick={onClick}
+    className={`w-full flex items-center space-x-3 px-4 py-3.5 rounded-xl transition-all duration-300 group ${active
+      ? 'bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 shadow-[0_0_15px_rgba(99,102,241,0.1)]'
+      : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
+      }`}
+  >
+    <div className={`transition-transform duration-300 ${active ? 'scale-110' : 'group-hover:scale-110'}`}>
+      {icon}
+    </div>
+    <span className="font-semibold text-sm tracking-wide">{label}</span>
+    {active && <div className="ml-auto w-1.5 h-1.5 rounded-full bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.8)]" />}
+  </button>
+);
+
+const BottomNavItem: React.FC<{
+  icon: React.ReactNode;
+  label: string;
+  active: boolean;
+  onClick: () => void
+}> = ({ icon, label, active, onClick }) => (
+  <button
+    onClick={onClick}
+    className={`flex flex-col items-center justify-center flex-1 py-1 transition-all ${active ? 'text-indigo-500' : 'text-slate-400'
+      }`}
+  >
+    <div className={`p-1 rounded-xl transition-all ${active ? 'bg-indigo-50' : ''}`}>
+      {icon}
+    </div>
+    <span className="text-[10px] font-bold mt-1 uppercase tracking-tighter">{label}</span>
+  </button>
+);
+
+const Card: React.FC<{ title?: string; children: React.ReactNode; className?: string; noPadding?: boolean }> = ({ title, children, className, noPadding }) => (
+  <div className={`bg-white rounded-3xl md:rounded-[2rem] shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-100 overflow-hidden transition-all ${className}`}>
+    {title && (
+      <div className="px-6 md:px-8 py-5 md:py-6 border-b border-slate-50 flex items-center justify-between">
+        <h3 className="text-base md:text-lg font-bold text-slate-800">{title}</h3>
+      </div>
+    )}
+    <div className={noPadding ? '' : 'p-6 md:p-8'}>
+      {children}
+    </div>
+  </div>
+);
+
+const StatCard: React.FC<{ icon: React.ReactNode; label: string; value: string | number; trend?: string; color: string; bgColor: string; onClick?: () => void }> = ({ icon, label, value, trend, color, bgColor, onClick }) => (
+  <div
+    onClick={onClick}
+    className={`bg-white p-5 md:p-8 rounded-3xl shadow-sm border border-slate-100 relative overflow-hidden group ${onClick ? 'cursor-pointer hover:border-indigo-200 transition-colors' : ''}`}
+  >
+    <div className="flex items-center md:flex-col md:items-start md:space-y-4 space-x-4 md:space-x-0">
+      <div className={`w-10 h-10 md:w-12 md:h-12 rounded-2xl ${bgColor} ${color} flex items-center justify-center shadow-inner shrink-0`}>
+        {icon}
+      </div>
+      <div>
+        <p className="text-[10px] md:text-xs font-bold text-slate-400 uppercase tracking-widest mb-0.5 md:mb-1">{label}</p>
+        <div className="flex items-baseline space-x-2">
+          <p className="text-xl md:text-3xl font-extrabold text-slate-900 leading-none">{value}</p>
+          {trend && (
+            <span className="text-[10px] font-bold text-emerald-500 bg-emerald-50 px-1.5 py-0.5 rounded-lg flex items-center">
+              {trend}
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
+  </div>
+);
+
+// --- Main App ---
+
+export default function App() {
+  const [view, setView] = useState<ViewType>('analytics');
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  // --- Storage Mode State ---
+  const [storageMode, setStorageMode] = useState<'local' | 'cloud' | null>(() => {
+    return localStorage.getItem('storage_preference') as 'local' | 'cloud' | null;
+  });
+
+  const [products, setProducts] = useState<Product[]>([]);
+  const [locales, setLocales] = useState<Locale[]>([]);
+  const [transfers, setTransfers] = useState<Transfer[]>([]);
+
+  // --- Initial Data Load (Local Mode) ---
+  useEffect(() => {
+    if (storageMode === 'local') {
+      const savedProducts = localStorage.getItem('master_inventory');
+      setProducts(savedProducts ? JSON.parse(savedProducts) : INITIAL_PRODUCTS);
+
+      const savedLocales = localStorage.getItem('locales_inventory');
+      if (savedLocales) {
+        const parsed: Locale[] = JSON.parse(savedLocales);
+        setLocales(parsed.map(p => {
+          const constantLocale = LOCALES.find(l => l.id === p.id);
+          return constantLocale ? { ...p, name: constantLocale.name } : p;
+        }));
+      } else {
+        setLocales(LOCALES);
+      }
+
+      const savedTransfers = localStorage.getItem('transfer_history');
+      setTransfers(savedTransfers ? JSON.parse(savedTransfers) : []);
+    }
+  }, [storageMode]);
+
+  // --- Firebase Sync (Cloud Mode) ---
+  useEffect(() => {
+    if (storageMode !== 'cloud') return;
+
+    const unsubProducts = onSnapshot(collection(db, 'products'), (snapshot) => {
+      const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Product));
+      setProducts(docs.length > 0 ? docs : INITIAL_PRODUCTS);
+      if (docs.length === 0) {
+        INITIAL_PRODUCTS.forEach(async p => await setDoc(doc(db, 'products', p.id), p));
+      }
+    });
+
+    const unsubLocales = onSnapshot(collection(db, 'locales'), (snapshot) => {
+      const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Locale));
+      if (docs.length > 0) {
+        setLocales(docs.map(p => {
+          const constantLocale = LOCALES.find(l => l.id === p.id);
+          return constantLocale ? { ...p, name: constantLocale.name } : p;
+        }));
+      } else {
+        LOCALES.forEach(async l => await setDoc(doc(db, 'locales', l.id), l));
+      }
+    });
+
+    const qTransfers = query(collection(db, 'transfers'), orderBy('date', 'desc'));
+    const unsubTransfers = onSnapshot(qTransfers, (snapshot) => {
+      const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Transfer));
+      setTransfers(docs);
+    });
+
+    return () => {
+      unsubProducts();
+      unsubLocales();
+      unsubTransfers();
+    };
+  }, [storageMode]);
+
+  // --- Data Persistence (Always Save Locally) ---
+  useEffect(() => {
+    // We save to localStorage regardless of mode, so 'Cloud' mode essentially syncs/caches to 'Local' storage.
+    // This ensures that history is available locally on the device memory as requested.
+    localStorage.setItem('master_inventory', JSON.stringify(products));
+    localStorage.setItem('locales_inventory', JSON.stringify(locales));
+    localStorage.setItem('transfer_history', JSON.stringify(transfers));
+  }, [products, locales, transfers]);
+
+  const selectStorageMode = (mode: 'local' | 'cloud') => {
+    setStorageMode(mode);
+    localStorage.setItem('storage_preference', mode);
+    // Reload to ensure clean state transition
+    window.location.reload();
+  };
+
+  const [isTransferModalOpen, setIsTransferModalOpen] = useState(false);
+  const [editingTransferId, setEditingTransferId] = useState<string | null>(null);
+  const [transferData, setTransferData] = useState({
+    productId: '',
+    localeId: '',
+    quantity: 0
+  });
+  const [transferCategoryFilter, setTransferCategoryFilter] = useState('all');
+
+  const [isProductModalOpen, setIsProductModalOpen] = useState(false);
+  const [editingProduct, setEditingProduct] = useState<Product | null>(null);
+  const [productData, setProductData] = useState({
+    sku: '',
+    name: '',
+    category: '',
+    masterStock: 0,
+    expirationDate: ''
+  });
+
+
+  const [isNewLocaleModalOpen, setIsNewLocaleModalOpen] = useState(false);
+  const [isManageLocalesModalOpen, setIsManageLocalesModalOpen] = useState(false);
+
+  // Auth State
+  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
+  // Auth Listener
+  useEffect(() => {
+    const unsubscribe = auth.onAuthStateChanged((currentUser) => {
+      setUser(currentUser);
+      setAuthLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  const handleLogin = async () => {
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (error) {
+      console.error("Login failed", error);
+      alert("Error al iniciar sesión con Google");
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+    } catch (error) {
+      console.error("Logout failed", error);
+    }
+  };
+
+  // --- Initial Layout Logic adjustment for loading ---
+  const [newLocaleName, setNewLocaleName] = useState('');
+  const [searchTerm, setSearchTerm] = useState('');
+  const [selectedCategory, setSelectedCategory] = useState<string>('all');
+  const [showCriticalOnly, setShowCriticalOnly] = useState(false);
+  const [showExpirationOnly, setShowExpirationOnly] = useState(false);
+
+  // --- Analytics data processing ---
+  const analyticsData = useMemo(() => {
+    const safeTransfers = Array.isArray(transfers) ? transfers : [];
+    const safeLocales = Array.isArray(locales) ? locales : [];
+
+    const topProductsByDestination = safeLocales.map(locale => {
+      const localeTransfers = safeTransfers.filter(t => t?.destinationLocaleId === locale.id);
+      const productTotals: { [key: string]: { name: string; total: number } } = {};
+      localeTransfers.forEach(t => {
+        if (!t) return;
+        const prodId = t.productId || 'unknown';
+        const prodName = t.productName || 'Producto Desconocido';
+        if (!productTotals[prodId]) {
+          productTotals[prodId] = { name: prodName, total: 0 };
+        }
+        productTotals[prodId].total += (t.quantity || 0);
+      });
+      const topProducts = Object.values(productTotals)
+        .sort((a, b) => b.total - a.total)
+        .slice(0, 5);
+      return {
+        localeName: locale.name || 'Sin nombre',
+        products: topProducts
+      };
+    });
+
+    const productDistribution: { [key: string]: { name: string; value: number } } = {};
+    safeTransfers.forEach(t => {
+      if (!t) return;
+      const prodId = t.productId || 'unknown';
+      const prodName = t.productName || 'Producto Desconocido';
+      if (!productDistribution[prodId]) {
+        productDistribution[prodId] = { name: prodName, value: 0 };
+      }
+      productDistribution[prodId].value += (t.quantity || 0);
+    });
+    const distributionData = Object.values(productDistribution)
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 8);
+
+    const trendData = Array.from({ length: 30 }, (_, i) => {
+      const date = new Date();
+      date.setDate(date.getDate() - (29 - i));
+      const dateStr = date.toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit' });
+      const dayTransfers = safeTransfers.filter(t => {
+        if (!t?.date) return false;
+        const match = t.date.match(/(\d{1,2})\/(\d{1,2})/);
+        if (match) {
+          const dMatch = match[1].padStart(2, '0');
+          const mMatch = match[2].padStart(2, '0');
+          return `${dMatch}/${mMatch}` === dateStr;
+        }
+        return false;
+      });
+      const total = dayTransfers.reduce((sum, t) => sum + (t.quantity || 0), 0);
+      return { date: dateStr, cantidad: total };
+    });
+
+    const destinationComparison = safeLocales.map(locale => {
+      if (!locale) return { destino: '?', total: 0, movimientos: 0 };
+      const localeTransfers = safeTransfers.filter(t => t?.destinationLocaleId === locale.id);
+      const total = localeTransfers.reduce((sum, t) => sum + (t?.quantity || 0), 0);
+      const count = localeTransfers.length;
+      const label = (locale.name || 'Desconocido');
+      return {
+        destino: label.length > 15 ? label.substring(0, 15) + '...' : label,
+        total,
+        movimientos: count
+      };
+    }).sort((a, b) => b.total - a.total);
+
+    return {
+      topProductsByDestination,
+      distributionData,
+      trendData,
+      destinationComparison
+    };
+  }, [transfers, locales]);
+
+  const COLORS = ['#4F46E5', '#10B981', '#F59E0B', '#F43F5E', '#8B5CF6', '#06B6D4', '#EC4899', '#14B8A6'];
+
+  const [historyFilterStart, setHistoryFilterStart] = useState('');
+  const [historyFilterEnd, setHistoryFilterEnd] = useState('');
+
+  // --- Data Persistence ---
+  useEffect(() => {
+    localStorage.setItem('master_inventory', JSON.stringify(products));
+    localStorage.setItem('locales_inventory', JSON.stringify(locales));
+    localStorage.setItem('transfer_history', JSON.stringify(transfers));
+  }, [products, locales, transfers]);
+
+  const openNewTransfer = () => {
+    setEditingTransferId(null);
+    setTransferData({ productId: '', localeId: '', quantity: 0 });
+    setTransferCategoryFilter('all');
+    setIsTransferModalOpen(true);
+    setIsMobileMenuOpen(false);
+  };
+
