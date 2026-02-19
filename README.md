@@ -6,7 +6,7 @@
 
 Sistema completo de gestión de inventario multi-ubicación con soporte para transferencias bidireccionales, escaneo de códigos de barras y sincronización en la nube.
 
-🔗 **Aplicación Desplegada:** https://deposito-inventory-f7a1b.web.app/
+🔗 **URL de Producción:** https://deposito-inventory-f7a1b.web.app/
 
 ## Características Principales
 

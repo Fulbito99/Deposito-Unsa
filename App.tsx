@@ -29,8 +29,11 @@ import {
   BarChart3,
   PieChart as PieChartIcon,
   Camera,
-  RefreshCw
+  RefreshCw,
+  FileText
 } from 'lucide-react';
+import jsPDF from 'jspdf';
+import autoTable from 'jspdf-autotable';
 import { Product, Locale, Transfer, ViewType } from './types';
 import { INITIAL_PRODUCTS, LOCALES } from './constants';
 import { PRODUCT_NAMES } from './product-names';
@@ -49,7 +52,8 @@ import {
   limit,
   getDocs,
   getDoc,
-  runTransaction
+  runTransaction,
+  serverTimestamp
 } from 'firebase/firestore';
 import {
   Wifi,
@@ -61,8 +65,6 @@ import {
   User
 } from 'lucide-react';
 import { auth, googleProvider } from './firebase';
-import jsPDF from 'jspdf';
-import autoTable from 'jspdf-autotable';
 import { signInWithPopup, signOut, User as FirebaseUser } from 'firebase/auth';
 import {
   BarChart,
@@ -86,20 +88,22 @@ const SidebarItem: React.FC<{
   icon: React.ReactNode;
   label: string;
   active: boolean;
-  onClick: () => void
-}> = ({ icon, label, active, onClick }) => (
+  onClick: () => void;
+  isCollapsed?: boolean;
+}> = ({ icon, label, active, onClick, isCollapsed }) => (
   <button
     onClick={onClick}
-    className={`w-full flex items-center space-x-3 px-4 py-3.5 rounded-xl transition-all duration-300 group ${active
+    title={isCollapsed ? label : ""}
+    className={`w-full flex items-center ${isCollapsed ? 'justify-center' : 'space-x-3 px-4'} py-3.5 rounded-xl transition-all duration-300 group ${active
       ? 'bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 shadow-[0_0_15px_rgba(99,102,241,0.1)]'
       : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
       }`}
   >
-    <div className={`transition-transform duration-300 ${active ? 'scale-110' : 'group-hover:scale-110'}`}>
+    <div className={`transition-transform duration-300 ${active ? 'scale-110' : 'group-hover:scale-110'} ${isCollapsed ? '' : ''}`}>
       {icon}
     </div>
-    <span className="font-semibold text-sm tracking-wide">{label}</span>
-    {active && <div className="ml-auto w-1.5 h-1.5 rounded-full bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.8)]" />}
+    {!isCollapsed && <span className="font-semibold text-sm tracking-wide truncate">{label}</span>}
+    {active && !isCollapsed && <div className="ml-auto w-1.5 h-1.5 rounded-full bg-indigo-500 shadow-[0_0_8px_rgba(99,102,241,0.8)]" />}
   </button>
 );
 
@@ -164,10 +168,13 @@ const StatCard: React.FC<{ icon: React.ReactNode; label: string; value: string |
 const matchesSearch = (product: Product, term: string) => {
   if (!term) return true;
   const t = term.toLowerCase().trim();
+  const name = product.name ? product.name.toLowerCase() : '';
+  const sku = product.sku ? product.sku.toLowerCase() : '';
+
   return (
-    product.name.toLowerCase().includes(t) ||
-    product.sku.toLowerCase().includes(t) ||
-    product.additionalSkus?.some(ask => ask.toLowerCase().includes(t)) || false
+    name.includes(t) ||
+    sku.includes(t) ||
+    product.additionalSkus?.some(ask => ask && ask.toLowerCase().includes(t)) || false
   );
 };
 
@@ -197,8 +204,16 @@ const getFilteredTransferProducts = (products: Product[], term: string, category
 // --- Main App ---
 
 export default function App() {
-  const [view, setView] = useState<ViewType>('analytics');
+  const [view, setView] = useState<ViewType>(() => {
+    return (localStorage.getItem('current_view') as ViewType) || 'analytics';
+  });
+
+  useEffect(() => {
+    localStorage.setItem('current_view', view);
+  }, [view]);
+
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   // --- Storage Mode State ---
   const [storageMode, setStorageMode] = useState<'local' | 'cloud' | null>(() => {
     return localStorage.getItem('storage_preference') as 'local' | 'cloud' | null;
@@ -216,11 +231,7 @@ export default function App() {
 
       const savedLocales = localStorage.getItem('locales_inventory');
       if (savedLocales) {
-        const parsed: Locale[] = JSON.parse(savedLocales);
-        setLocales(parsed.map(p => {
-          const constantLocale = LOCALES.find(l => l.id === p.id);
-          return constantLocale ? { ...p, name: constantLocale.name } : p;
-        }));
+        setLocales(JSON.parse(savedLocales));
       } else {
         setLocales(LOCALES);
       }
@@ -258,13 +269,18 @@ export default function App() {
 
     // Real-time: Listen for Locales
     const unsubLocales = onSnapshot(collection(db, 'locales'), (snapshot) => {
-      const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Locale));
+      const docs = snapshot.docs.map(doc => {
+        const data = doc.data();
+        // Ensure inventory field exists to prevent crashes
+        return {
+          id: doc.id,
+          name: data.name || 'Sin nombre',
+          inventory: data.inventory || []
+        } as Locale;
+      });
 
       if (docs.length > 0) {
-        setLocales(docs.map(p => {
-          const constantLocale = LOCALES.find(l => l.id === p.id);
-          return constantLocale ? { ...p, name: constantLocale.name } : p;
-        }));
+        setLocales(docs);
       } else {
         // Initialize if empty
         LOCALES.forEach(async l => await setDoc(doc(db, 'locales', l.id), l));
@@ -273,12 +289,47 @@ export default function App() {
       console.error("Error watching locales:", error);
     });
 
-    // Optimized: Listen only to last 300 transfers
-    const qTransfers = query(collection(db, 'transfers'), orderBy('date', 'desc'), limit(300));
+    // Optimized: Fetch more and sort in memory due to DD/MM/YYYY string format sorting issues
+    const qTransfers = query(collection(db, 'transfers'), limit(1000));
     const unsubTransfers = onSnapshot(qTransfers, (snapshot) => {
       const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Transfer));
-      // Deduplicate
-      const uniqueDocs = Array.from(new Map(docs.map(item => [item.id, item])).values());
+
+      // Sort correctly by parsing DD/MM/YYYY
+      const sortedDocs = docs.sort((a, b) => {
+        if (!a.date || !b.date) return 0;
+
+        const parseDateTime = (str: string) => {
+          try {
+            const parts = str.split(',');
+            const datePart = parts[0].trim();
+            const timePart = parts[1]?.trim();
+            const [d, m, y] = datePart.split('/').map(Number);
+            if (timePart) {
+              const [hh, mm, ss] = timePart.split(':').map(Number);
+              return new Date(y, m - 1, d, hh, mm, ss).getTime();
+            }
+            return new Date(y, m - 1, d).getTime();
+          } catch (e) {
+            return 0;
+          }
+        };
+
+        const res = parseDateTime(b.date) - parseDateTime(a.date);
+        if (res !== 0) return res;
+
+        // Fallback to timestamp if available and dates are identical
+        if (a.timestamp && b.timestamp) {
+          try {
+            return b.timestamp.toMillis() - a.timestamp.toMillis();
+          } catch (e) {
+            return 0;
+          }
+        }
+        return 0;
+      });
+
+      // Deduplicate by ID just in case
+      const uniqueDocs = Array.from(new Map(sortedDocs.map(item => [item.id, item])).values());
       setTransfers(uniqueDocs);
     });
 
@@ -300,14 +351,7 @@ export default function App() {
     };
   }, [storageMode]);
 
-  // --- Data Persistence (Always Save Locally) ---
-  useEffect(() => {
-    // We save to localStorage regardless of mode, so 'Cloud' mode essentially syncs/caches to 'Local' storage.
-    // This ensures that history is available locally on the device memory as requested.
-    localStorage.setItem('master_inventory', JSON.stringify(products));
-    localStorage.setItem('locales_inventory', JSON.stringify(locales));
-    localStorage.setItem('transfer_history', JSON.stringify(transfers));
-  }, [products, locales, transfers]);
+
 
   const selectStorageMode = (mode: 'local' | 'cloud') => {
     setStorageMode(mode);
@@ -316,29 +360,7 @@ export default function App() {
     window.location.reload();
   };
 
-  const refreshData = async () => {
-    if (storageMode !== 'cloud') return;
 
-    try {
-      // Fetch fresh products
-      const productsSnapshot = await getDocs(collection(db, 'products'));
-      const freshProducts = productsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Product));
-      setProducts(freshProducts);
-
-      // Fetch fresh locales
-      const localesSnapshot = await getDocs(collection(db, 'locales'));
-      const freshLocales = localesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Locale));
-      setLocales(freshLocales.map(p => {
-        const constantLocale = LOCALES.find(l => l.id === p.id);
-        return constantLocale ? { ...p, name: constantLocale.name } : p;
-      }));
-
-      // alert('✓ Datos actualizados');
-    } catch (error) {
-      console.error('Error refreshing data:', error);
-      alert('Error al actualizar datos');
-    }
-  };
 
 
   const [isTransferModalOpen, setIsTransferModalOpen] = useState(false);
@@ -465,7 +487,10 @@ export default function App() {
     const trendData = Array.from({ length: trendDays }, (_, i) => {
       const date = new Date();
       date.setDate(date.getDate() - ((trendDays - 1) - i));
-      const dateStr = date.toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit' });
+      const d = String(date.getDate()).padStart(2, '0');
+      const m = String(date.getMonth() + 1).padStart(2, '0');
+      const dateStr = `${d}/${m}`;
+
       const dayTransfers = safeTransfers.filter(t => {
         if (!t?.date) return false;
         const match = t.date.match(/(\d{1,2})\/(\d{1,2})/);
@@ -541,6 +566,12 @@ export default function App() {
     return ['all', ...allCategories.sort()];
   }, [products, customCategories]);
 
+  const supplierOptions = useMemo(() => {
+    const cats = categories.filter(c => c !== 'all');
+    const locs = locales.map(l => l.name);
+    return [...cats, ...locs].sort();
+  }, [categories, locales]);
+
   // --- Data Persistence ---
   useEffect(() => {
     localStorage.setItem('master_inventory', JSON.stringify(products));
@@ -548,11 +579,9 @@ export default function App() {
     localStorage.setItem('transfer_history', JSON.stringify(transfers));
     localStorage.setItem('custom_categories', JSON.stringify(customCategories));
 
-    // Sync categories to Firestore in cloud mode
-    if (storageMode === 'cloud' && customCategories.length > 0) {
-      setDoc(doc(db, 'settings', 'categories'), { customCategories }, { merge: true });
-    }
-  }, [products, locales, transfers, customCategories, storageMode]);
+    // NO CLOUD SYNC HERE - It causes infinite loop with the listener.
+    // Categories are now synced explicitly in handleAdd/Edit/Delete
+  }, [products, locales, transfers, customCategories]);
 
   const openNewTransfer = (initialData?: { productId: string; localeId: string; quantity: number; sourceLocaleId?: string }) => {
     setEditingTransferId(null);
@@ -602,6 +631,8 @@ export default function App() {
       return;
     }
 
+    // Default: Main View Search using Scanner
+
     // If transfer modal is open or we are in transfers view, search for product by SKU
     if (isTransferModalOpen || view === 'transfers') {
       const foundProduct = products.find(p => matchesSearch(p, cleanCode));
@@ -629,64 +660,121 @@ export default function App() {
   };
 
   const handleDeleteTransfer = async (transferId: string) => {
-    if (!window.confirm("¿Eliminar movimiento? El stock volverá al depósito.")) return;
+    if (!window.confirm("¿Eliminar movimiento? Se revertirán los cambios de stock.")) return;
 
     const transfer = transfers.find(t => t.id === transferId);
     if (!transfer) return;
 
-    if (storageMode === 'cloud') {
-      // Firebase Logic
-      const product = products.find(p => p.id === transfer.productId);
-      const locale = locales.find(l => l.id === transfer.destinationLocaleId);
+    const { productId, quantity, sourceLocaleId, destinationLocaleId } = transfer;
 
-      if (product) {
-        await updateDoc(doc(db, 'products', product.id), { masterStock: product.masterStock + transfer.quantity });
-      }
-      if (locale) {
-        await updateDoc(doc(db, 'locales', locale.id), {
-          inventory: locale.inventory.map(item => item.productId === transfer.productId ? { ...item, stock: Math.max(0, item.stock - transfer.quantity) } : item)
+    try {
+      if (storageMode === 'cloud') {
+        await runTransaction(db, async (transaction) => {
+          const productRef = doc(db, 'products', productId);
+          const productDoc = await transaction.get(productRef);
+
+          let destRef = null;
+          let destDoc = null;
+          if (destinationLocaleId !== 'deposit') {
+            destRef = doc(db, 'locales', destinationLocaleId);
+            destDoc = await transaction.get(destRef);
+          }
+
+          let sourceRef = null;
+          let sourceDoc = null;
+          if (sourceLocaleId !== 'deposit' && destinationLocaleId !== 'deposit') {
+            sourceRef = doc(db, 'locales', sourceLocaleId);
+            sourceDoc = await transaction.get(sourceRef);
+          }
+
+          // Determine Master Stock changes
+          let masterStockChange = 0;
+
+          // 1. Revert Destination (Subtract stock that was added)
+          if (destinationLocaleId === 'deposit') {
+            masterStockChange -= quantity;
+          } else {
+            if (destRef && destDoc && destDoc.exists()) {
+              const currentInv = destDoc.data().inventory || [];
+              const newInv = currentInv.map((item: any) =>
+                item.productId === productId ? { ...item, stock: Math.max(0, item.stock - quantity) } : item
+              );
+              transaction.update(destRef, { inventory: newInv });
+            }
+          }
+
+          // 2. Revert Source (Add back stock that was deducted)
+          // IF Destination was Deposit, user wants to ONLY subtract from Deposit, skipping source reversal
+          if (sourceLocaleId !== 'deposit' && destinationLocaleId !== 'deposit') {
+            if (sourceRef && sourceDoc && sourceDoc.exists()) {
+              const sData = sourceDoc.data();
+              const isSourceExempt = ['PRADERAS', 'DIQUE', 'SOHO', 'MARKET'].includes((sData.name || '').toUpperCase());
+
+              if (!isSourceExempt) {
+                const currentInv = sData.inventory || [];
+                const hasItem = currentInv.some((i: any) => i.productId === productId);
+                let newInv;
+                if (hasItem) {
+                  newInv = currentInv.map((item: any) => item.productId === productId ? { ...item, stock: item.stock + quantity } : item);
+                } else {
+                  newInv = [...currentInv, { productId, stock: quantity }];
+                }
+                transaction.update(sourceRef, { inventory: newInv });
+              }
+            }
+          } else if (sourceLocaleId === 'deposit') {
+            masterStockChange += quantity;
+          }
+
+          if (productDoc.exists() && masterStockChange !== 0) {
+            transaction.update(productRef, { masterStock: (productDoc.data().masterStock || 0) + masterStockChange });
+          }
+
+          transaction.delete(doc(db, 'transfers', transferId));
         });
-      }
-      await deleteDoc(doc(db, 'transfers', transferId));
 
-      // Update Local State for Cloud Mode (Since listeners are off)
-      if (product) {
-        setProducts(prev => prev.map(p =>
-          p.id === product.id ? { ...p, masterStock: p.masterStock + transfer.quantity } : p
-        ));
-      }
-      if (locale) {
+      } else {
+        // LOCAL LOGIC
+        // 1. Update Master Stock if needed
+        setProducts(prev => prev.map(p => {
+          if (p.id !== productId) return p;
+          let change = 0;
+          if (destinationLocaleId === 'deposit') change -= quantity;
+          if (sourceLocaleId === 'deposit') change += quantity;
+          return { ...p, masterStock: p.masterStock + change };
+        }));
+
+        // 2. Update Locales
         setLocales(prev => prev.map(l => {
-          if (l.id === locale.id) {
+          const isExempt = ['PRADERAS', 'DIQUE', 'SOHO', 'MARKET'].includes((l.name || '').toUpperCase());
+
+          // Revert Destination (Subtract)
+          if (l.id === destinationLocaleId) {
             return {
               ...l,
-              inventory: l.inventory.map(item =>
-                item.productId === transfer.productId ? { ...item, stock: Math.max(0, item.stock - transfer.quantity) } : item
-              )
+              inventory: l.inventory.map(i => i.productId === productId ? { ...i, stock: Math.max(0, i.stock - quantity) } : i)
+            };
+          }
+
+          // Revert Source (Add back, unless exempt or destination was Deposit)
+          if (l.id === sourceLocaleId && !isExempt && destinationLocaleId !== 'deposit') {
+            const hasItem = l.inventory?.some(i => i.productId === productId) ?? false;
+            return {
+              ...l,
+              inventory: hasItem
+                ? l.inventory.map(i => i.productId === productId ? { ...i, stock: i.stock + quantity } : i)
+                : [...(l.inventory || []), { productId, stock: quantity }]
             };
           }
           return l;
         }));
-      }
-      setTransfers(prev => prev.filter(t => t.id !== transferId));
 
-    } else {
-      // Local Storage Logic
-      setProducts(prev => prev.map(p =>
-        p.id === transfer.productId ? { ...p, masterStock: p.masterStock + transfer.quantity } : p
-      ));
-      setLocales(prev => prev.map(l => {
-        if (l.id === transfer.destinationLocaleId) {
-          return {
-            ...l,
-            inventory: l.inventory.map(item =>
-              item.productId === transfer.productId ? { ...item, stock: Math.max(0, item.stock - transfer.quantity) } : item
-            )
-          };
-        }
-        return l;
-      }));
-      setTransfers(prev => prev.filter(t => t.id !== transferId));
+        setTransfers(prev => prev.filter(t => t.id !== transferId));
+      }
+      alert("✓ Movimiento eliminado y stocks revertidos");
+    } catch (err: any) {
+      console.error(err);
+      alert("Error completando la operación: " + err.message);
     }
   };
 
@@ -743,7 +831,9 @@ export default function App() {
           } else {
             const item = sourceLocaleData?.inventory.find(i => i.productId === productId);
             const currentStock = item?.stock || 0;
-            if (currentStock < quantity) {
+            const isExempt = ['PRADERAS', 'DIQUE', 'SOHO', 'MARKET'].includes((sourceLocaleData?.name || '').toUpperCase());
+
+            if (currentStock < quantity && !isExempt) {
               throw new Error(`Stock insuficiente en ${sourceLocaleData?.name}. Disponible: ${currentStock}`);
             }
           }
@@ -751,9 +841,12 @@ export default function App() {
           // 3. PERFORM UPDATES (Writes)
 
           // Dedcut from Source
+          // Dedcut from Source
+          const isSourceExempt = sourceLocaleData && ['PRADERAS', 'DIQUE', 'SOHO', 'MARKET'].includes((sourceLocaleData.name || '').toUpperCase());
+
           if (sourceLocaleId === 'deposit') {
             transaction.update(productRef, { masterStock: productData.masterStock - quantity });
-          } else {
+          } else if (!isSourceExempt) {
             if (!sourceLocaleData) throw new Error("Error interno: Datos de origen perdidos");
             const newInventory = sourceLocaleData.inventory.map(item =>
               item.productId === productId ? { ...item, stock: item.stock - quantity } : item
@@ -766,14 +859,14 @@ export default function App() {
             transaction.update(productRef, { masterStock: productData.masterStock + quantity });
           } else {
             if (!destLocaleData) throw new Error("Error interno: Datos de destino perdidos");
-            const hasItem = destLocaleData.inventory.some(i => i.productId === productId);
+            const hasItem = destLocaleData.inventory?.some(i => i.productId === productId) ?? false;
             let newInventory;
             if (hasItem) {
               newInventory = destLocaleData.inventory.map(item =>
                 item.productId === productId ? { ...item, stock: item.stock + quantity } : item
               );
             } else {
-              newInventory = [...destLocaleData.inventory, { productId, stock: quantity }];
+              newInventory = [...(destLocaleData.inventory || []), { productId, stock: quantity }];
             }
             transaction.update(doc(db, 'locales', localeId), { inventory: newInventory });
           }
@@ -791,160 +884,89 @@ export default function App() {
             destinationLocaleId: localeId,
             destinationLocaleName: localeId === 'deposit' ? 'Depósito Central' : (destLocaleData?.name || 'Desconocido'),
             sourceLocaleId: sourceLocaleId || 'deposit',
-            sourceLocaleName: sourceLocaleId === 'deposit' ? 'Depósito Central' : (sourceLocaleData?.name || 'Local')
+            sourceLocaleName: sourceLocaleId === 'deposit' ? 'Depósito Central' : (sourceLocaleData?.name || 'Local'),
+            timestamp: serverTimestamp()
           };
           transaction.set(newTransferRef, transferDocData);
         });
 
         // 4. UPDATE LOCAL STATE (Optimistic / Confirmation)
-        const product = products.find(p => p.id === productId);
+        // ... (This part is often skipped if we rely on listener, but for immediate feedback/offline suppport logic typically goes here)
+        // Since we have listeners, we just close modal and wait for sync or do optimistic update if critical.
+        // For simplicity with listeners active:
+        setIsTransferModalOpen(false);
+        setIsSubmitting(false);
+        alert("Movimiento ejecutado");
 
-        // Optimistic Update Source
+      } else {
+        // LOCAL MODE LOGIC
+        // ... (existing local logic would be here, but let's assume Cloud for now as per user context usually)
+        // Check Source Stock
+        const sourceProduct = products.find(p => p.id === productId);
+        if (!sourceProduct) return; // Should not happen
+
         if (sourceLocaleId === 'deposit') {
-          setProducts(prev => prev.map(p => p.id === productId ? { ...p, masterStock: p.masterStock - quantity } : p));
+          if (sourceProduct.masterStock < quantity) {
+            alert(`Stock insuficiente en Depósito Central. Disponible: ${sourceProduct.masterStock}`);
+            setIsSubmitting(false);
+            return;
+          }
         } else {
-          setLocales(prev => prev.map(l => {
-            if (l.id === sourceLocaleId) {
-              return { ...l, inventory: l.inventory.map(i => i.productId === productId ? { ...i, stock: i.stock - quantity } : i) };
-            }
-            return l;
-          }));
+          const sourceLocale = locales.find(l => l.id === sourceLocaleId);
+          const item = sourceLocale?.inventory.find(i => i.productId === productId);
+          const isExempt = ['PRADERAS', 'DIQUE', 'SOHO', 'MARKET'].includes((sourceLocale?.name || '').toUpperCase());
+
+          if ((item?.stock || 0) < quantity && !isExempt) {
+            alert(`Stock insuficiente en ${sourceLocale?.name}`);
+            setIsSubmitting(false);
+            return;
+          }
         }
 
-        // Optimistic Update Destination
-        if (localeId === 'deposit') {
-          setProducts(prev => prev.map(p => p.id === productId ? { ...p, masterStock: p.masterStock + quantity } : p));
-        } else {
-          setLocales(prev => prev.map(l => {
-            if (l.id === localeId) {
-              const exists = l.inventory.some(i => i.productId === productId);
-              return {
-                ...l,
-                inventory: exists
-                  ? l.inventory.map(i => i.productId === productId ? { ...i, stock: i.stock + quantity } : i)
-                  : [...l.inventory, { productId, stock: quantity }]
-              };
-            }
-            return l;
-          }));
-        }
+        // Update State manually
+        setProducts(prev => prev.map(p =>
+          p.id === productId && sourceLocaleId === 'deposit' ? { ...p, masterStock: p.masterStock - quantity } :
+            (p.id === productId && localeId === 'deposit' ? { ...p, masterStock: p.masterStock + quantity } : p)
+        ));
 
-        // Add to history UI
+        setLocales(prev => prev.map(l => {
+          // Deduct from source
+          // Deduct from source
+          if (l.id === sourceLocaleId) {
+            if (['PRADERAS', 'DIQUE', 'SOHO', 'MARKET'].includes((l.name || '').toUpperCase())) return l;
+            return { ...l, inventory: l.inventory.map(i => i.productId === productId ? { ...i, stock: i.stock - quantity } : i) };
+          }
+          // Add to dest
+          if (l.id === localeId) {
+            const hasItem = l.inventory?.some(i => i.productId === productId) ?? false;
+            return {
+              ...l, inventory: hasItem
+                ? l.inventory.map(i => i.productId === productId ? { ...i, stock: i.stock + quantity } : i)
+                : [...(l.inventory || []), { productId, stock: quantity }]
+            };
+          }
+          return l;
+        }));
+
         const now = new Date();
-        const strictDate = `${String(now.getDate()).padStart(2, '0')}/${String(now.getMonth() + 1).padStart(2, '0')}/${now.getFullYear()}, ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
-
-        const newTransferObj: Transfer = {
-          id: 'temp-' + Math.random(),
-          date: strictDate,
+        const newTransfer: Transfer = {
+          id: Date.now().toString(),
+          date: now.toLocaleString(),
           productId,
-          productName: product?.name || '',
+          productName: products.find(p => p.id === productId)?.name || 'Unknown',
           quantity,
           destinationLocaleId: localeId,
-          destinationLocaleName: localeId === 'deposit' ? 'Depósito Central' : (locales.find(l => l.id === localeId)?.name || 'Desconocido'),
-          sourceLocaleId: sourceLocaleId || 'deposit',
-          sourceLocaleName: sourceLocaleId === 'deposit' ? 'Depósito Central' : (locales.find(l => l.id === sourceLocaleId)?.name || 'Local')
+          destinationLocaleName: localeId === 'deposit' ? 'Depósito Central' : locales.find(l => l.id === localeId)?.name || 'Unknown',
+          sourceLocaleId: sourceLocaleId,
+          sourceLocaleName: sourceLocaleId === 'deposit' ? 'Depósito Central' : locales.find(l => l.id === sourceLocaleId)?.name || 'Unknown'
         };
-        setTransfers(prev => [newTransferObj, ...prev]);
-
-      } else {
-        // LOCAL STORAGE MODE 
-
-        const product = products.find(p => p.id === productId);
-        if (!product) return;
-
-        // Check Stock
-        if (sourceLocaleId === 'deposit') {
-          if (product.masterStock < quantity) { alert("Stock insuficiente en depósito"); setIsSubmitting(false); return; }
-        } else {
-          const srcLoc = locales.find(l => l.id === sourceLocaleId);
-          const stok = srcLoc?.inventory.find(i => i.productId === productId)?.stock || 0;
-          if (stok < quantity) { alert("Stock insuficiente"); setIsSubmitting(false); return; }
-        }
-
-        // 1. Handle Source Decrement
-        if (sourceLocaleId === 'deposit') {
-          setProducts(prev => prev.map(p =>
-            p.id === productId ? { ...p, masterStock: p.masterStock - quantity } : p
-          ));
-        } else {
-          setLocales(prev => prev.map(l => {
-            if (l.id === sourceLocaleId) {
-              return { ...l, inventory: l.inventory.map(i => i.productId === productId ? { ...i, stock: Math.max(0, i.stock - quantity) } : i) };
-            }
-            return l;
-          }));
-        }
-
-        // 2. Handle Destination Increment
-        if (localeId === 'deposit') {
-          setProducts(prev => prev.map(p =>
-            p.id === productId ? { ...p, masterStock: p.masterStock + quantity } : p
-          ));
-        } else {
-          setLocales(prev => prev.map(l => {
-            if (l.id === localeId) {
-              const hasItem = l.inventory.some(i => i.productId === productId);
-              return {
-                ...l,
-                inventory: hasItem
-                  ? l.inventory.map(item => item.productId === productId ? { ...item, stock: item.stock + quantity } : item)
-                  : [...l.inventory, { productId, stock: quantity }]
-              };
-            }
-            return l;
-          }));
-        }
-
-        // 3. Save Transfer
-        if (editingTransferId) {
-          setTransfers(prev => prev.map(t => t.id === editingTransferId ? {
-            ...t,
-            quantity,
-            productId,
-            productName: product.name,
-            destinationLocaleId: localeId,
-            destinationLocaleName: locales.find(l => l.id === localeId)?.name || '',
-            sourceLocaleId,
-            sourceLocaleName: sourceLocaleId === 'deposit' ? 'Depósito Central' : locales.find(l => l.id === sourceLocaleId)?.name
-          } : t));
-        } else {
-          const now = new Date();
-          const strictDate = `${String(now.getDate()).padStart(2, '0')}/${String(now.getMonth() + 1).padStart(2, '0')}/${now.getFullYear()}, ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
-
-          const newTransfer: Transfer = {
-            id: Math.random().toString(36).substr(2, 9),
-            date: strictDate,
-            productId,
-            productName: product.name,
-            quantity,
-            destinationLocaleId: localeId,
-            destinationLocaleName: localeId === 'deposit' ? 'Depósito Central' : (locales.find(l => l.id === localeId)?.name || 'Desconocido'),
-            sourceLocaleId: sourceLocaleId || 'deposit',
-            sourceLocaleName: sourceLocaleId === 'deposit' ? 'Depósito Central' : (locales.find(l => l.id === sourceLocaleId)?.name || 'Local')
-          };
-          setTransfers(prev => [newTransfer, ...prev]);
-        }
+        setTransfers(prev => [newTransfer, ...prev]);
+        setIsTransferModalOpen(false);
+        setIsSubmitting(false);
       }
-
-      alert('✓ Movimiento realizado con éxito');
-
-      // Reset form
-      setTransferData({ ...transferData, productId: '', quantity: 0 });
-      setTransferSearchTerm('');
-      setShowTransferSuggestions(false);
-      setEditingTransferId(null);
-
-    } catch (error) {
-      console.error("Error submitting transfer:", error);
-      const errorMessage = error instanceof Error ? error.message : String(error);
-
-      if (errorMessage.includes("Stock insuficiente")) {
-        alert(`Error de sincronización: El stock en el servidor es diferente al local.\n\nDetalle: ${errorMessage}\n\nActualizando datos para corregir...`);
-        await refreshData();
-      } else {
-        alert("Error al procesar el movimiento: " + errorMessage);
-      }
-    } finally {
+    } catch (err: any) {
+      console.error(err);
+      alert("Error: " + err.message);
       setIsSubmitting(false);
     }
   };
@@ -989,8 +1011,7 @@ export default function App() {
           const newId = Math.random().toString(36).substr(2, 9);
           await setDoc(doc(db, 'products', newId), { id: newId, sku, name, category, masterStock, expirationDate, additionalSkus });
         }
-        // Force refresh to ensure UI is in sync with Server
-        await refreshData();
+
       } else {
         if (editingProduct) {
           setProducts(prev => prev.map(p =>
@@ -1032,11 +1053,11 @@ export default function App() {
   };
 
   const getProductStockInLocale = (productId: string, locale: Locale) => {
-    return locale.inventory.find(item => item.productId === productId)?.stock || 0;
+    return locale.inventory?.find(item => item.productId === productId)?.stock || 0;
   };
 
   const totalItemsMaster = products.reduce((acc, p) => acc + p.masterStock, 0);
-  const totalItemsLocales = locales.reduce((acc, l) => acc + l.inventory.reduce((sub, item) => sub + item.stock, 0), 0);
+  const totalItemsLocales = locales.reduce((acc, l) => acc + (l.inventory?.reduce((sub, item) => sub + item.stock, 0) || 0), 0);
 
   const filteredProducts = products.filter(p => {
     let matches = matchesSearch(p, searchTerm);
@@ -1128,6 +1149,23 @@ export default function App() {
       }
 
       return dateMatch && matchesCategory && matchesLocale && matchesSearch;
+    }).sort((a, b) => {
+      const parseDateTime = (str: string) => {
+        try {
+          const parts = str.split(',');
+          const datePart = parts[0].trim();
+          const timePart = parts[1]?.trim();
+          const [d, m, y] = datePart.split('/').map(Number);
+          if (timePart) {
+            const [hh, mm, ss] = timePart.split(':').map(Number);
+            return new Date(y, m - 1, d, hh, mm, ss).getTime();
+          }
+          return new Date(y, m - 1, d).getTime();
+        } catch (e) {
+          return 0;
+        }
+      };
+      return parseDateTime(b.date) - parseDateTime(a.date);
     });
   }, [transfers, historyFilterMode, historySingleDate, historyFilterStart, historyFilterEnd, selectedCategory, products, historyFilterLocale, historySearchTerm]);
 
@@ -1169,13 +1207,34 @@ export default function App() {
   };
 
   const handleRenameLocale = async (localeId: string, currentName: string) => {
+    console.log('🔧 handleRenameLocale called:', { localeId, currentName, storageMode });
     const newName = prompt("Nuevo nombre para el destino:", currentName);
-    if (!newName || newName.trim() === currentName) return;
+    console.log('📝 User entered:', newName);
+
+    if (!newName || newName.trim() === currentName) {
+      console.log('❌ Rename cancelled or same name');
+      return;
+    }
+
+    console.log('✅ Proceeding with rename to:', newName);
 
     if (storageMode === 'cloud') {
-      await updateDoc(doc(db, 'locales', localeId), { name: newName });
+      console.log('☁️ Updating Firestore...');
+      // Use setDoc with merge to create document if it doesn't exist
+      // Include inventory field to prevent crashes
+      const currentLocale = locales.find(l => l.id === localeId);
+      await setDoc(doc(db, 'locales', localeId), {
+        name: newName,
+        inventory: currentLocale?.inventory || []
+      }, { merge: true });
+      console.log('✅ Firestore updated');
     } else {
-      setLocales(prev => prev.map(l => l.id === localeId ? { ...l, name: newName } : l));
+      console.log('💾 Updating local state...');
+      setLocales(prev => {
+        const updated = prev.map(l => l.id === localeId ? { ...l, name: newName } : l);
+        console.log('📊 New locales state:', updated);
+        return updated;
+      });
     }
   };
 
@@ -1189,7 +1248,15 @@ export default function App() {
       return;
     }
 
-    setCustomCategories(prev => [...prev, trimmedName]);
+    setCustomCategories(prev => {
+      const updated = [...prev, trimmedName];
+      if (storageMode === 'cloud') {
+        const uniqueCategories = [...new Set(updated)]; // Ensure uniqueness just in case
+        setDoc(doc(db, 'settings', 'categories'), { customCategories: uniqueCategories }, { merge: true })
+          .catch(err => console.error("Error saving category:", err));
+      }
+      return updated;
+    });
     setNewCategoryName('');
     setIsNewCategoryModalOpen(false);
   };
@@ -1198,12 +1265,17 @@ export default function App() {
     if (confirm(`¿Eliminar la categoría "${category}"? Se actualizarán los productos a "Sin Categoría".`)) {
 
       // 1. Remove from customCategories
-      const newCategories = customCategories.filter(c => c !== category);
-      setCustomCategories(newCategories);
+      setCustomCategories(prev => {
+        const newCategories = prev.filter(c => c !== category);
+        if (storageMode === 'cloud') {
+          setDoc(doc(db, 'settings', 'categories'), { customCategories: newCategories }, { merge: true })
+            .catch(err => console.error("Error deleting category:", err));
+        }
+        return newCategories;
+      });
 
       // 2. Update all products in that category to 'Uncategorized' (or just remove category?)
-      // We'll set them to a default System category or just leave them string-wise?
-      // Better to set them to something explicit if we want to be clean.
+      // We'll set them to something explicit if we want to be clean.
       // But for now, let's just update products.
       if (storageMode === 'cloud') {
         // Batch update would be best, or individual.
@@ -1231,7 +1303,14 @@ export default function App() {
     }
 
     // 1. Update customCategories list
-    setCustomCategories(prev => prev.map(c => c === oldName ? trimmedName : c));
+    setCustomCategories(prev => {
+      const updated = prev.map(c => c === oldName ? trimmedName : c);
+      if (storageMode === 'cloud') {
+        setDoc(doc(db, 'settings', 'categories'), { customCategories: updated }, { merge: true })
+          .catch(err => console.error("Error renaming category:", err));
+      }
+      return updated;
+    });
 
     // 2. Update products
     if (storageMode === 'cloud') {
@@ -1537,6 +1616,9 @@ export default function App() {
     event.target.value = '';
   };
 
+  // Export Incomes to PDF removed
+
+
   if (authLoading) {
     return (
       <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
@@ -1640,54 +1722,118 @@ export default function App() {
 
   return (
     <div className="flex min-h-screen pb-24 md:pb-0">
-      {/* Sidebar - Desktop Only */}
-      <aside className="w-72 sidebar-gradient hidden md:flex flex-col sticky top-0 h-screen shadow-2xl z-20">
-        <div className="p-8">
-          <div className="mb-8 flex flex-col items-center">
-            <img src="/logo.png" alt="Logo" className="w-56 h-auto object-contain drop-shadow-lg transform hover:scale-105 transition-transform duration-300" />
+
+
+      {/* Unified Collapsible Sidebar - Desktop Only */}
+      <aside className={`
+        hidden md:flex md:sticky top-0 left-0 h-screen z-50 transition-all duration-300 sidebar-gradient bg-slate-900 flex-col shadow-2xl
+        md:translate-x-0
+        ${isSidebarCollapsed ? 'md:w-24' : 'md:w-72'}
+      `}>
+        {/* Sidebar Header */}
+        <div className={`p-4 ${isSidebarCollapsed && !isMobileMenuOpen ? 'px-4' : 'px-6'} flex items-center justify-between`}>
+          <div className="flex flex-col items-center flex-1 relative">
+            {!isSidebarCollapsed || isMobileMenuOpen ? (
+              <img src="/logo.png" alt="Logo" className="w-32 h-auto object-contain drop-shadow-lg transform hover:scale-105 transition-transform duration-300" />
+            ) : (
+              <div className="w-12 h-12 bg-white rounded-xl flex items-center justify-center shadow-lg">
+                <Package className="w-7 h-7 text-indigo-600" />
+              </div>
+            )}
           </div>
-          <nav className="space-y-1.5">
-            <SidebarItem icon={<LayoutDashboard className="w-5 h-5" />} label="Dashboard" active={view === 'analytics'} onClick={() => { setView('analytics'); setShowCriticalOnly(false); setShowExpirationOnly(false); }} />
-            <SidebarItem icon={<Warehouse className="w-5 h-5" />} label="Stock Central" active={view === 'master'} onClick={() => { setView('master'); setShowCriticalOnly(false); setShowExpirationOnly(false); }} />
-            <SidebarItem icon={<ArrowRightLeft className="w-5 h-5" />} label="Movimientos" active={view === 'transfers'} onClick={() => { setView('transfers'); setShowCriticalOnly(false); setShowExpirationOnly(false); }} />
-            <SidebarItem icon={<History className="w-5 h-5" />} label="Historial" active={view === 'history'} onClick={() => { setView('history'); setShowCriticalOnly(false); setShowExpirationOnly(false); }} />
-            <SidebarItem icon={<MapPin className="w-5 h-5" />} label="Destinos" active={view === 'locales'} onClick={() => { setView('locales'); setShowCriticalOnly(false); setShowExpirationOnly(false); }} />
-            <SidebarItem icon={<Settings className="w-5 h-5" />} label="Gestión" active={view === 'management'} onClick={() => { setView('management'); setShowCriticalOnly(false); setShowExpirationOnly(false); }} />
-          </nav>
+
+          {/* Mobile Close Button */}
+          {isMobileMenuOpen && (
+            <button
+              onClick={() => setIsMobileMenuOpen(false)}
+              className="md:hidden p-2 text-slate-400 hover:text-white"
+            >
+              <X className="w-6 h-6" />
+            </button>
+          )}
+
+          {/* Desktop Collapse Toggle */}
+          <button
+            onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
+            className="hidden md:flex absolute -right-4 top-10 bg-indigo-600 text-white p-1 rounded-full shadow-lg z-50 hover:bg-indigo-700 transition-all"
+          >
+            {isSidebarCollapsed ? <ChevronRight className="w-4 h-4" /> : <ChevronRight className="w-4 h-4 rotate-180" />}
+          </button>
         </div>
-        <div className="mt-auto p-8 space-y-4">
-          <div className="pt-4 border-t border-indigo-500/20">
-            <p className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest mb-3 px-2">Gestión de Datos</p>
-            <div className="grid grid-cols-3 gap-2">
-              {storageMode === 'cloud' && (
+
+        {/* Navigation Items */}
+        <div className={`flex-1 overflow-y-auto ${isSidebarCollapsed && !isMobileMenuOpen ? 'px-3' : 'px-6'}`}>
+          <nav className="space-y-1.5">
+            <SidebarItem isCollapsed={isSidebarCollapsed && !isMobileMenuOpen} icon={<LayoutDashboard className="w-5 h-5" />} label="Dashboard" active={view === 'analytics'} onClick={() => { setView('analytics'); setShowCriticalOnly(false); setShowExpirationOnly(false); setIsMobileMenuOpen(false); }} />
+            <SidebarItem isCollapsed={isSidebarCollapsed && !isMobileMenuOpen} icon={<Warehouse className="w-5 h-5" />} label="Stock Central" active={view === 'master'} onClick={() => { setView('master'); setShowCriticalOnly(false); setShowExpirationOnly(false); setIsMobileMenuOpen(false); }} />
+            <SidebarItem isCollapsed={isSidebarCollapsed && !isMobileMenuOpen} icon={<ArrowRightLeft className="w-5 h-5" />} label="Movimientos" active={view === 'transfers'} onClick={() => { setView('transfers'); setShowCriticalOnly(false); setShowExpirationOnly(false); setIsMobileMenuOpen(false); }} />
+            <SidebarItem isCollapsed={isSidebarCollapsed && !isMobileMenuOpen} icon={<History className="w-5 h-5" />} label="Historial" active={view === 'history'} onClick={() => { setView('history'); setShowCriticalOnly(false); setShowExpirationOnly(false); setIsMobileMenuOpen(false); }} />
+            <SidebarItem isCollapsed={isSidebarCollapsed && !isMobileMenuOpen} icon={<MapPin className="w-5 h-5" />} label="Destinos" active={view === 'locales'} onClick={() => { setView('locales'); setShowCriticalOnly(false); setShowExpirationOnly(false); setIsMobileMenuOpen(false); }} />
+            <SidebarItem isCollapsed={isSidebarCollapsed && !isMobileMenuOpen} icon={<Settings className="w-5 h-5" />} label="Gestión" active={view === 'management'} onClick={() => { setView('management'); setShowCriticalOnly(false); setShowExpirationOnly(false); setIsMobileMenuOpen(false); }} />
+          </nav>
+
+
+        </div>
+
+        {/* Sidebar Footer */}
+        <div className={`p-4 ${isSidebarCollapsed && !isMobileMenuOpen ? 'px-4' : 'px-6'} space-y-2`}>
+          {(!isSidebarCollapsed || isMobileMenuOpen) && (
+            <div className="space-y-2">
+              <div className="grid grid-cols-2 gap-2">
                 <button
-                  onClick={refreshData}
-                  className="flex flex-col items-center justify-center p-3 rounded-xl bg-emerald-500/20 text-emerald-400 hover:text-white hover:bg-emerald-500/30 transition-all group border border-emerald-500/30"
-                  title="Refrescar datos desde la nube"
+                  onClick={handleExportData}
+                  className="flex flex-col items-center justify-center p-2 rounded-xl bg-slate-800 text-xs font-bold text-slate-400 hover:text-white hover:bg-slate-700 transition-all group border border-slate-700/50"
+                  title="Exportar JSON"
                 >
-                  <RefreshCw className="w-5 h-5 mb-1 group-hover:rotate-180 transition-transform duration-500" />
-                  <span className="text-[9px] font-bold">Refrescar</span>
+                  <Download className="w-4 h-4 mb-1" />
+                  <span>JSON</span>
                 </button>
-              )}
-              <button
-                onClick={handleExportData}
-                className="flex flex-col items-center justify-center p-3 rounded-xl bg-slate-800/50 text-slate-400 hover:text-white hover:bg-indigo-500/20 transition-all group"
-              >
-                <Download className="w-5 h-5 mb-1 group-hover:-translate-y-0.5 transition-transform" />
-                <span className="text-[9px] font-bold">Exportar</span>
-              </button>
-              <label className="flex flex-col items-center justify-center p-3 rounded-xl bg-slate-800/50 text-slate-400 hover:text-white hover:bg-indigo-500/20 transition-all group cursor-pointer">
-                <Upload className="w-5 h-5 mb-1 group-hover:-translate-y-0.5 transition-transform" />
-                <span className="text-[9px] font-bold">Importar</span>
+                <button
+                  onClick={handleExportProductsCSV}
+                  className="flex flex-col items-center justify-center p-2 rounded-xl bg-slate-800 text-xs font-bold text-slate-400 hover:text-white hover:bg-slate-700 transition-all group border border-slate-700/50"
+                  title="Exportar CSV"
+                >
+                  <FileText className="w-4 h-4 mb-1" />
+                  <span>CSV</span>
+                </button>
+              </div>
+
+              <label className="flex items-center justify-center gap-2 p-2 rounded-xl bg-indigo-600/10 text-xs font-bold text-indigo-400 hover:text-white hover:bg-indigo-600 transition-all cursor-pointer border border-indigo-500/20">
+                <Upload className="w-4 h-4" />
+                <span>Importar Datos</span>
                 <input type="file" accept=".json" onChange={handleImportData} className="hidden" />
               </label>
             </div>
-          </div>
+          )}
 
-          <button onClick={openNewTransfer} className="w-full bg-white text-slate-900 font-bold py-4 px-4 rounded-2xl flex items-center justify-center space-x-2 transition-all hover:scale-[1.02] shadow-xl">
+          <button
+            onClick={openNewTransfer}
+            className={`w-full bg-white text-slate-900 font-bold py-3 rounded-2xl flex items-center justify-center space-x-2 transition-all hover:scale-[1.02] shadow-xl`}
+          >
             <ArrowRightLeft className="w-5 h-5 text-indigo-500" />
-            <span>Transferencia</span>
+            {(!isSidebarCollapsed || isMobileMenuOpen) && <span>Transferencia</span>}
           </button>
+
+          {/* User Profile */}
+          {(!isSidebarCollapsed || isMobileMenuOpen) && (
+            <div className="pt-4 border-t border-indigo-500/20 flex items-center justify-between">
+              <div className="flex items-center gap-2 min-w-0">
+                <div className="w-8 h-8 rounded-lg bg-indigo-500 flex items-center justify-center text-white font-black text-xs">
+                  {user?.email?.[0].toUpperCase() || 'U'}
+                </div>
+                <div className="min-w-0">
+                  <p className="text-xs font-bold text-white truncate">{user?.displayName || 'Usuario'}</p>
+                </div>
+              </div>
+              <button
+                onClick={handleLogout}
+                className="p-2 text-slate-400 hover:text-rose-500 transition-colors"
+                title="Cerrar Sesión"
+              >
+                <LogOut className="w-4 h-4" />
+              </button>
+            </div>
+          )}
         </div>
       </aside>
 
@@ -1697,7 +1843,7 @@ export default function App() {
         <header className="flex flex-col lg:flex-row lg:items-center justify-between mb-8 md:mb-12 gap-6">
           <div className="flex items-center justify-between md:block">
             <div>
-              <img src="/logo.png" alt="Logo" className="h-20 w-auto mb-4 object-contain md:hidden drop-shadow-md" />
+              <img src="/logo.png" alt="Logo" className="h-12 w-auto mb-4 object-contain md:hidden drop-shadow-md" />
               <div className="flex items-center space-x-2 mb-1 md:mb-2">
                 <span className={`text-[10px] md:text-xs font-bold px-2 py-0.5 rounded-full uppercase tracking-widest flex items-center gap-1 ${storageMode === 'cloud' ? 'bg-violet-100 text-violet-600' : 'bg-slate-100 text-slate-600'}`}>
                   {storageMode === 'cloud' ? <><Cloud className="w-3 h-3" /> Nube</> : <><Smartphone className="w-3 h-3" /> Local</>}
@@ -1706,7 +1852,7 @@ export default function App() {
               <h2 className="text-2xl md:text-4xl font-black text-slate-900 tracking-tight leading-none">
                 {view === 'master' && 'Depósito'}
                 {view === 'analytics' && 'Resumen'}
-                {view.startsWith('locale') && locales.find(l => l.id === view)?.name}
+                {view.startsWith('locale') && locales.find(l => l.id === view.replace('locale-', ''))?.name}
                 {view === 'history' && 'Logs'}
                 {view === 'management' && 'Gestión'}
               </h2>
@@ -1727,14 +1873,7 @@ export default function App() {
                 </button>
               )}
             </div>
-            <div className="md:hidden">
-              <button
-                onClick={() => setIsMobileMenuOpen(true)}
-                className="p-3 bg-white border border-slate-200 rounded-2xl shadow-sm text-slate-600 active:scale-90 transition-all"
-              >
-                <Menu className="w-6 h-6" />
-              </button>
-            </div>
+
           </div>
 
           <div className="flex flex-col md:flex-row items-center gap-4 w-full md:w-auto">
@@ -2000,7 +2139,7 @@ export default function App() {
                   }
                   className="lg:col-span-2"
                 >
-                  {analyticsData.trendData.some(d => d.cantidad > 0) ? (
+                  {analyticsData.trendData?.some(d => (d.cantidad ?? 0) > 0) ? (
                     <div className="h-80">
                       <ResponsiveContainer width="100%" height="100%">
                         <LineChart data={analyticsData.trendData}>
@@ -2045,7 +2184,7 @@ export default function App() {
               </div>
 
               {/* Top Products by Destination */}
-              {analyticsData.topProductsByDestination.some(d => d.products.length > 0) && (
+              {analyticsData?.topProductsByDestination?.some(d => (d?.products?.length ?? 0) > 0) && (
                 <Card title="Top Productos por Destino" className="">
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                     {analyticsData.topProductsByDestination
@@ -2199,7 +2338,7 @@ export default function App() {
                     <div className="grid grid-cols-1 gap-4 md:hidden">
                       {filteredProducts.map(p => {
                         const stock = isLocaleView
-                          ? getProductStockInLocale(p.id, locales.find(l => l.id === view)!)
+                          ? getProductStockInLocale(p.id, locales.find(l => l.id === view.replace('locale-', ''))!)
                           : p.masterStock;
 
                         const isLowStock = stock <= 5;
@@ -2280,7 +2419,7 @@ export default function App() {
                             <tbody className="divide-y divide-slate-100">
                               {filteredProducts.map(p => {
                                 const stock = isLocaleView
-                                  ? getProductStockInLocale(p.id, locales.find(l => l.id === view)!)
+                                  ? getProductStockInLocale(p.id, locales.find(l => l.id === view.replace('locale-', ''))!)
                                   : p.masterStock;
                                 const isLowStock = stock <= 5;
                                 return (
@@ -2406,7 +2545,7 @@ export default function App() {
                             : (() => {
                               const sourceLocale = locales.find(l => l.id === transferData.sourceLocaleId);
                               if (!sourceLocale || !transferData.productId) return 0;
-                              const item = sourceLocale.inventory.find(i => i.productId === transferData.productId);
+                              const item = sourceLocale.inventory?.find(i => i.productId === transferData.productId);
                               return item?.stock || 0;
                             })()
                           } unidades
@@ -2487,6 +2626,7 @@ export default function App() {
                                     onClick={() => {
                                       setTransferData(prev => ({ ...prev, productId: p.id }));
                                       setTransferSearchTerm(p.name);
+                                      setTransferCategoryFilter(p.category);
                                       setShowTransferSuggestions(false);
                                     }}
                                     className="w-full text-left px-4 py-3 hover:bg-indigo-50 transition-colors border-b border-slate-100 last:border-b-0 flex justify-between items-center group"
@@ -2498,7 +2638,7 @@ export default function App() {
                                     <div className="text-xs font-bold text-slate-500 bg-slate-100 px-2 py-1 rounded-lg group-hover:bg-indigo-100 group-hover:text-indigo-600">
                                       Stock: {transferData.sourceLocaleId === 'deposit'
                                         ? p.masterStock
-                                        : (locales.find(l => l.id === transferData.sourceLocaleId)?.inventory.find(i => i.productId === p.id)?.stock || 0)}
+                                        : (locales.find(l => l.id === transferData.sourceLocaleId)?.inventory?.find(i => i.productId === p.id)?.stock || 0)}
                                     </div>
                                   </button>
                                 ))
@@ -2536,6 +2676,8 @@ export default function App() {
               </Card>
             </div>
           )}
+
+          {/* Incomes view removed */}
 
           {view === 'history' && (
             <div className="space-y-8">
@@ -2652,6 +2794,7 @@ export default function App() {
                       className="bg-slate-50 border border-slate-200 rounded-lg px-2 py-1 text-xs font-bold text-slate-700 outline-none uppercase focus:border-indigo-400 transition-colors min-w-[100px]"
                     >
                       <option value="">TODOS</option>
+                      <option value="deposit">DEPÓSITO CENTRAL</option>
                       {locales.map(l => (
                         <option key={l.id} value={l.id}>{l.name}</option>
                       ))}
@@ -2722,14 +2865,20 @@ export default function App() {
                               <div className="w-8 h-8 md:w-10 md:h-10 bg-indigo-600 text-white rounded-lg md:rounded-xl flex items-center justify-center shrink-0 shadow-md shadow-indigo-200 mt-1 md:mt-0">
                                 <History className="w-4 h-4 md:w-5 md:h-5" />
                               </div>
-                              <div className="min-w-0 flex-1">
+                              <div className="min-w-0 flex-1 overflow-hidden">
                                 <div className="flex justify-between items-start gap-2">
-                                  <h4 className="text-xs md:text-sm font-black text-slate-800 truncate leading-tight">{t.productName}</h4>
+                                  <div className="overflow-x-auto pb-1 -mb-1">
+                                    <h4 className="text-xs md:text-sm font-black text-slate-800 whitespace-nowrap leading-tight">{t.productName}</h4>
+                                  </div>
                                   <span className="text-[10px] font-black text-slate-400 bg-slate-50 px-1.5 py-0.5 rounded-md whitespace-nowrap shrink-0 md:hidden">
                                     {t.date.split(',')[1]?.trim().slice(0, 5) || ''}
                                   </span>
                                 </div>
                                 <div className="flex flex-wrap items-center gap-2 mt-1.5">
+                                  <div className="flex items-center gap-1 text-[10px] font-bold text-slate-500 bg-slate-50 px-2 py-0.5 rounded-md border border-slate-100 max-w-full">
+                                    <span className="text-slate-400">De:</span>
+                                    <span className="uppercase truncate">{t.sourceLocaleName || 'Depósito'}</span>
+                                  </div>
                                   <div className="flex items-center gap-1 text-[10px] font-bold text-slate-500 bg-slate-50 px-2 py-0.5 rounded-md border border-slate-100 max-w-full">
                                     <MapPin className="w-3 h-3 text-slate-400 shrink-0" />
                                     <span className="uppercase truncate">{t.destinationLocaleName}</span>
@@ -2791,6 +2940,7 @@ export default function App() {
                             <tr>
                               <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Hora</th>
                               <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Producto</th>
+                              <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Origen</th>
                               <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">Destino</th>
                               <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">Cantidad</th>
                               <th className="px-6 py-4 text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Acciones</th>
@@ -2804,6 +2954,11 @@ export default function App() {
                                 </td>
                                 <td className="px-6 py-4">
                                   <span className="text-sm font-bold text-slate-900">{t.productName}</span>
+                                </td>
+                                <td className="px-6 py-4">
+                                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-50 text-slate-500 text-[10px] font-bold uppercase tracking-wide border border-slate-200">
+                                    {t.sourceLocaleName || 'Depósito Central'}
+                                  </span>
                                 </td>
                                 <td className="px-6 py-4">
                                   <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-100 text-slate-600 text-[10px] font-bold uppercase tracking-wide border border-slate-200">
@@ -2881,7 +3036,7 @@ export default function App() {
                         <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">ID: {l.id.slice(0, 8)}...</p>
                       </div>
                     </div>
-                    <div className="flex flex-col gap-2 opacity-100 md:opacity-0 group-hover:opacity-100 transition-opacity">
+                    <div className="flex flex-col gap-2">
                       <button
                         onClick={() => handleRenameLocale(l.id, l.name)}
                         className="p-2 bg-slate-50 text-slate-400 rounded-lg hover:text-indigo-600 hover:bg-indigo-50 border border-slate-100"
@@ -2910,27 +3065,41 @@ export default function App() {
         </div>
       </main>
 
-      {/* Floating Action Button (Mobile) - Only in Stock Views */}
-      {(view === 'master' || view.startsWith('locale')) && (
-        <div className="fixed bottom-28 right-6 md:hidden z-30">
-          <button
-            onClick={openNewTransfer}
-            className="w-16 h-16 bg-indigo-600 text-white rounded-full shadow-2xl flex items-center justify-center transition-all active:scale-90 active:bg-indigo-700"
-          >
-            <Plus className="w-8 h-8" />
-          </button>
-        </div>
-      )}
+      {/* Bottom Navigation Bar (Mobile) */}
+      <div className="fixed bottom-0 left-0 right-0 bg-white/90 backdrop-blur-lg border-t border-slate-200 px-2 py-2 md:hidden z-40 flex justify-between items-center pb-safe h-[calc(3.5rem+env(safe-area-inset-bottom))] shadow-lg shadow-slate-200/50">
+        <BottomNavItem
+          icon={<LayoutDashboard className="w-5 h-5" />}
+          label="Inicio"
+          active={view === 'analytics'}
+          onClick={() => { setView('analytics'); setIsMobileMenuOpen(false); window.scrollTo(0, 0); }}
+        />
+        <BottomNavItem
+          icon={<Warehouse className="w-5 h-5" />}
+          label="Stock"
+          active={view === 'master'}
+          onClick={() => { setView('master'); setIsMobileMenuOpen(false); window.scrollTo(0, 0); }}
+        />
+        <BottomNavItem
+          icon={<ArrowRightLeft className="w-5 h-5" />}
+          label="Mover"
+          active={view === 'transfers'}
+          onClick={() => { setView('transfers'); setIsMobileMenuOpen(false); window.scrollTo(0, 0); }}
+        />
+        <BottomNavItem
+          icon={<History className="w-5 h-5" />}
+          label="Logs"
+          active={view === 'history'}
+          onClick={() => { setView('history'); setIsMobileMenuOpen(false); window.scrollTo(0, 0); }}
+        />
+        <BottomNavItem
+          icon={<Menu className="w-5 h-5" />}
+          label="Menú"
+          active={isMobileMenuOpen}
+          onClick={() => setIsMobileMenuOpen(true)}
+        />
+      </div>
 
-      {/* Bottom Nav (Mobile) */}
-      <nav className="fixed bottom-0 left-0 right-0 bg-white/80 backdrop-blur-xl border-t border-slate-100 px-2 py-3 md:hidden flex items-center justify-around z-40 shadow-[0_-10px_30px_rgba(0,0,0,0.03)]">
-        <BottomNavItem icon={<LayoutDashboard className="w-5 h-5" />} label="Home" active={view === 'analytics'} onClick={() => setView('analytics')} />
-        <BottomNavItem icon={<Warehouse className="w-5 h-5" />} label="Stock" active={view === 'master'} onClick={() => setView('master')} />
-        <BottomNavItem icon={<ArrowRightLeft className="w-5 h-5" />} label="Mover" active={view === 'transfers'} onClick={() => setView('transfers')} />
-        <BottomNavItem icon={<History className="w-5 h-5" />} label="Historial" active={view === 'history'} onClick={() => setView('history')} />
-        <BottomNavItem icon={<Settings className="w-5 h-5" />} label="Gestión" active={view === 'management'} onClick={() => setView('management')} />
-        <BottomNavItem icon={<Store className="w-5 h-5" />} label="Más" active={view.startsWith('locale')} onClick={() => setIsMobileMenuOpen(true)} />
-      </nav>
+
 
       {/* Mobile Drawer (Sucursales Selection) */}
       {
@@ -2951,7 +3120,22 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Locales list removed from mobile menu */}
+              <div className="grid grid-cols-2 gap-3 mb-6">
+                <button
+                  onClick={() => { setView('locales'); setIsMobileMenuOpen(false); }}
+                  className={`p-4 rounded-2xl border flex flex-col items-center gap-2 transition-all ${view === 'locales' ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-slate-50 text-slate-600 border-slate-100'}`}
+                >
+                  <MapPin className="w-6 h-6" />
+                  <span className="font-bold text-xs uppercase tracking-wider">Destinos</span>
+                </button>
+                <button
+                  onClick={() => { setView('management'); setIsMobileMenuOpen(false); }}
+                  className={`p-4 rounded-2xl border flex flex-col items-center gap-2 transition-all ${view === 'management' ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-slate-50 text-slate-600 border-slate-100'}`}
+                >
+                  <Settings className="w-6 h-6" />
+                  <span className="font-bold text-xs uppercase tracking-wider">Gestión</span>
+                </button>
+              </div>
 
 
               <div className="mt-8 pt-8 border-t border-slate-100">
@@ -2959,15 +3143,7 @@ export default function App() {
                   <Settings className="w-4 h-4 mr-2 text-indigo-500" /> Datos
                 </h4>
                 <div className="grid grid-cols-2 gap-4">
-                  {storageMode === 'cloud' && (
-                    <button
-                      onClick={refreshData}
-                      className="col-span-2 p-4 rounded-2xl bg-emerald-50 text-emerald-600 font-bold text-sm flex items-center justify-center gap-2 border border-emerald-100 hover:bg-emerald-100 transition-colors shadow-sm"
-                    >
-                      <RefreshCw className="w-5 h-5" />
-                      Refrescar Datos (Nube)
-                    </button>
-                  )}
+
                   <button
                     onClick={handleExportData}
                     className="p-4 rounded-2xl bg-indigo-50 text-indigo-600 font-bold text-sm flex flex-col items-center justify-center gap-2"
@@ -3220,7 +3396,7 @@ export default function App() {
                                 <div className="text-xs font-bold text-slate-500 bg-slate-100 px-2 py-1 rounded-lg group-hover:bg-indigo-100 group-hover:text-indigo-600">
                                   Stock: {transferData.sourceLocaleId === 'deposit'
                                     ? p.masterStock
-                                    : (locales.find(l => l.id === transferData.sourceLocaleId)?.inventory.find(i => i.productId === p.id)?.stock || 0)}
+                                    : (locales.find(l => l.id === transferData.sourceLocaleId)?.inventory?.find(i => i.productId === p.id)?.stock || 0)}
                                 </div>
                               </button>
                             ))
@@ -3490,6 +3666,8 @@ export default function App() {
           </div>
         )
       }
+
+      { /* Income Modal removed */}
 
       {/* New Category Modal */}
       {isNewCategoryModalOpen && (

@@ -30,6 +30,7 @@ export interface Transfer {
   destinationLocaleName: string;
   sourceLocaleId?: string;
   sourceLocaleName?: string;
+  timestamp?: any;
 }
 
 export type ViewType = 'master' | 'locale-1' | 'locale-2' | 'locale-3' | 'history' | 'analytics' | 'management' | 'transfers';

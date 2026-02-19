@@ -1,5 +1,7 @@
 {
-  "projects": {},
+  "projects": {
+    "default": "deposito-inventory-f7a1b"
+  },
   "targets": {},
   "etags": {}
 }

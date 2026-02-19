@@ -12,5 +12,5 @@ export const INITIAL_PRODUCTS: Product[] = [
 export const LOCALES: Locale[] = [
   { id: 'locale-1', name: 'El Punto', inventory: [] },
   { id: 'locale-2', name: 'La Central', inventory: [] },
-  { id: 'locale-3', name: 'Salud', inventory: [] },
+  { id: 'locale-3', name: 'La Guardia', inventory: [] },
 ];
