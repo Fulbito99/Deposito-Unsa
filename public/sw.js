@@ -1,14 +1,14 @@
-const CACHE_NAME = 'deposito-cache-v1';
+const CACHE_NAME = 'deposito-cache-v4';
 const ASSETS_TO_CACHE = [
     '/',
     '/index.html',
     '/manifest.json',
-    '/logo.png',
-    '/index.css'
+    '/logo.png'
 ];
 
 // Install Event
 self.addEventListener('install', (event) => {
+    self.skipWaiting();
     event.waitUntil(
         caches.open(CACHE_NAME).then((cache) => {
             console.log('Caching shell assets');
@@ -24,34 +24,36 @@ self.addEventListener('activate', (event) => {
             return Promise.all(
                 keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key))
             );
-        })
+        }).then(() => self.clients.claim())
     );
 });
 
 // Fetch Event
 self.addEventListener('fetch', (event) => {
-    // Only cache GET requests
+    // Only fetch GET requests
     if (event.request.method !== 'GET') return;
 
     event.respondWith(
-        caches.match(event.request).then((cacheRes) => {
-            return (
-                cacheRes ||
-                fetch(event.request).then((fetchRes) => {
-                    return caches.open(CACHE_NAME).then((cache) => {
-                        // Don't cache firestore/auth calls
-                        if (event.request.url.indexOf('firestore') === -1 && event.request.url.indexOf('googleapis') === -1) {
-                            cache.put(event.request.url, fetchRes.clone());
-                        }
-                        return fetchRes;
-                    });
-                })
-            );
-        }).catch(() => {
-            // Fallback for offline if not in cache
-            if (event.request.url.indexOf('.html') > -1) {
-                return caches.match('/index.html');
-            }
-        })
+        fetch(event.request)
+            .then((fetchRes) => {
+                return caches.open(CACHE_NAME).then((cache) => {
+                    const url = event.request.url;
+                    if (url.startsWith(self.location.origin) &&
+                        !url.includes('firestore') &&
+                        !url.includes('googleapis')) {
+                        cache.put(event.request, fetchRes.clone());
+                    }
+                    return fetchRes;
+                });
+            })
+            .catch(() => {
+                return caches.match(event.request).then((cacheRes) => {
+                    if (cacheRes) return cacheRes;
+                    if (event.request.mode === 'navigate') {
+                        return caches.match('/index.html');
+                    }
+                });
+            })
     );
 });
+

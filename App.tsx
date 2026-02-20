@@ -30,7 +30,8 @@ import {
   PieChart as PieChartIcon,
   Camera,
   RefreshCw,
-  FileText
+  FileText,
+  Laptop
 } from 'lucide-react';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
@@ -352,6 +353,38 @@ export default function App() {
   }, [storageMode]);
 
 
+
+  // --- PWA Installation Logic ---
+  const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
+
+  useEffect(() => {
+    // Check if the event was already fired before React mounted
+    if ((window as any).deferredPrompt) {
+      setDeferredPrompt((window as any).deferredPrompt);
+    }
+
+    const handleBeforeInstallPrompt = (e: any) => {
+      e.preventDefault();
+      setDeferredPrompt(e);
+      (window as any).deferredPrompt = e; // Store it globally too
+    };
+
+    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+    };
+  }, []);
+
+  const handleInstallClick = () => {
+    if (!deferredPrompt) return;
+    deferredPrompt.prompt();
+    deferredPrompt.userChoice.then((choiceResult: any) => {
+      if (choiceResult.outcome === 'accepted') {
+        setDeferredPrompt(null);
+      }
+    });
+  };
 
   const selectStorageMode = (mode: 'local' | 'cloud') => {
     setStorageMode(mode);
@@ -1129,16 +1162,6 @@ export default function App() {
         dateMatch = afterStart && beforeEnd;
       }
 
-      let matchesCategory = true;
-      if (selectedCategory !== 'all') {
-        const product = products.find(p => p.id === t.productId);
-        if (product) {
-          matchesCategory = product.category === selectedCategory;
-        } else {
-          matchesCategory = false;
-        }
-      }
-
       const matchesLocale = historyFilterLocale ? t.destinationLocaleId === historyFilterLocale : true;
 
       // Search Term Filter
@@ -1148,7 +1171,7 @@ export default function App() {
         matchesSearch = (t.productName || '').toLowerCase().includes(term);
       }
 
-      return dateMatch && matchesCategory && matchesLocale && matchesSearch;
+      return dateMatch && matchesLocale && matchesSearch;
     }).sort((a, b) => {
       const parseDateTime = (str: string) => {
         try {
@@ -1806,7 +1829,20 @@ export default function App() {
             </div>
           )}
 
+
+          {deferredPrompt && (
+            <button
+              onClick={handleInstallClick}
+              className={`w-full bg-indigo-600 text-white font-bold py-3 rounded-2xl flex items-center justify-center space-x-2 transition-all hover:scale-[1.02] shadow-xl mb-3`}
+              title="Instalar Aplicación"
+            >
+              <Laptop className="w-5 h-5 text-indigo-200" />
+              {(!isSidebarCollapsed || isMobileMenuOpen) && <span>Instalar App</span>}
+            </button>
+          )}
+
           <button
+
             onClick={openNewTransfer}
             className={`w-full bg-white text-slate-900 font-bold py-3 rounded-2xl flex items-center justify-center space-x-2 transition-all hover:scale-[1.02] shadow-xl`}
           >
@@ -1886,35 +1922,37 @@ export default function App() {
                 <span>Nuevo Producto</span>
               </button>
             )}
-            <div className="w-full md:w-auto relative group flex items-center gap-2">
-              <select
-                value={selectedCategory}
-                onChange={(e) => setSelectedCategory(e.target.value)}
-                className="pl-3 pr-8 py-3.5 md:py-4 bg-slate-50 border border-slate-200 rounded-2xl text-xs md:text-sm font-bold text-slate-600 focus:outline-none focus:ring-4 focus:ring-indigo-500/10 focus:border-indigo-500 shadow-sm transition-all outline-none appearance-none cursor-pointer hover:bg-slate-100 shrink-0 w-32 md:w-36 truncate"
-              >
-                <option value="all">Todas</option>
-                {categories.filter(c => c !== 'all').map(category => (
-                  <option key={category} value={category}>{category}</option>
-                ))}
-              </select>
-              <div className="relative w-full md:w-96">
-                <Search className="w-5 h-5 absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" />
-                <input
-                  type="text"
-                  placeholder="Buscar por nombre o SKU..."
-                  value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
-                  className="w-full pl-12 pr-12 py-3.5 md:py-4 bg-white border border-slate-200 rounded-2xl text-sm font-medium focus:outline-none focus:ring-4 focus:ring-indigo-500/10 focus:border-indigo-500 shadow-sm transition-all"
-                />
-                <button
-                  onClick={() => setIsScannerOpen(true)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 p-1.5 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-all"
-                  title="Escanear código de barras"
+            {(view === 'master' || (view.startsWith('locale') && view !== 'locales')) && (
+              <div className="w-full md:w-auto relative group flex items-center gap-2">
+                <select
+                  value={selectedCategory}
+                  onChange={(e) => setSelectedCategory(e.target.value)}
+                  className="pl-3 pr-8 py-3.5 md:py-4 bg-slate-50 border border-slate-200 rounded-2xl text-xs md:text-sm font-bold text-slate-600 focus:outline-none focus:ring-4 focus:ring-indigo-500/10 focus:border-indigo-500 shadow-sm transition-all outline-none appearance-none cursor-pointer hover:bg-slate-100 shrink-0 w-32 md:w-36 truncate"
                 >
-                  <Camera className="w-5 h-5" />
-                </button>
+                  <option value="all">Todas</option>
+                  {categories.filter(c => c !== 'all').map(category => (
+                    <option key={category} value={category}>{category}</option>
+                  ))}
+                </select>
+                <div className="relative w-full md:w-96">
+                  <Search className="w-5 h-5 absolute left-4 top-1/2 -translate-y-1/2 text-slate-400" />
+                  <input
+                    type="text"
+                    placeholder="Buscar por nombre o SKU..."
+                    value={searchTerm}
+                    onChange={(e) => setSearchTerm(e.target.value)}
+                    className="w-full pl-12 pr-12 py-3.5 md:py-4 bg-white border border-slate-200 rounded-2xl text-sm font-medium focus:outline-none focus:ring-4 focus:ring-indigo-500/10 focus:border-indigo-500 shadow-sm transition-all"
+                  />
+                  <button
+                    onClick={() => setIsScannerOpen(true)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 p-1.5 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-all"
+                    title="Escanear código de barras"
+                  >
+                    <Camera className="w-5 h-5" />
+                  </button>
+                </div>
               </div>
-            </div>
+            )}
           </div>
         </header>
 
@@ -2536,19 +2574,11 @@ export default function App() {
                       </select>
                     </div>
 
-                    {transferData.sourceLocaleId && (
+                    {transferData.sourceLocaleId === 'deposit' && (
                       <div className="p-4 bg-emerald-50 rounded-xl border border-emerald-100">
                         <p className="text-xs font-bold text-emerald-600 uppercase tracking-wider mb-2">Stock Disponible</p>
                         <p className="text-2xl font-black text-emerald-700">
-                          {transferData.sourceLocaleId === 'deposit'
-                            ? products.find(p => p.id === transferData.productId)?.masterStock || 0
-                            : (() => {
-                              const sourceLocale = locales.find(l => l.id === transferData.sourceLocaleId);
-                              if (!sourceLocale || !transferData.productId) return 0;
-                              const item = sourceLocale.inventory?.find(i => i.productId === transferData.productId);
-                              return item?.stock || 0;
-                            })()
-                          } unidades
+                          {products.find(p => p.id === transferData.productId)?.masterStock || 0} unidades
                         </p>
                       </div>
                     )}
