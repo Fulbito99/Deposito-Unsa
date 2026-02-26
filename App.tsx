@@ -54,7 +54,9 @@ import {
   getDocs,
   getDoc,
   runTransaction,
-  serverTimestamp
+  serverTimestamp,
+  where,
+  Timestamp
 } from 'firebase/firestore';
 import {
   Wifi,
@@ -223,6 +225,23 @@ export default function App() {
   const [products, setProducts] = useState<Product[]>([]);
   const [locales, setLocales] = useState<Locale[]>([]);
   const [transfers, setTransfers] = useState<Transfer[]>([]);
+  const [historyLimit, setHistoryLimit] = useState(30);
+  const [stats, setStats] = useState<any>(null);
+
+  const [historyFilterStart, setHistoryFilterStart] = useState('');
+  const [historyFilterEnd, setHistoryFilterEnd] = useState('');
+  const [historyFilterLocale, setHistoryFilterLocale] = useState<string>('');
+  const [historyFilterMode, setHistoryFilterMode] = useState<'date' | 'range'>('range');
+  const [historySearchTerm, setHistorySearchTerm] = useState('');
+  const [historySingleDate, setHistorySingleDate] = useState(() => {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  });
+
+  const [customCategories, setCustomCategories] = useState<string[]>([]);
 
   // --- Initial Data Load (Local Mode) ---
   useEffect(() => {
@@ -249,99 +268,83 @@ export default function App() {
     // Real-time: Listen for Products
     const unsubProducts = onSnapshot(collection(db, 'products'), (snapshot) => {
       const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Product));
-
-      if (docs.length > 0) {
-        setProducts(docs);
-      } else {
-        // Initialize if empty (only attempts once per session if critical)
-        // Ideally we shouldn't auto-init on every empty snapshot if deletion was intentional,
-        // but keeping legacy behavior for safety if DB is wiped.
-        setProducts(INITIAL_PRODUCTS);
-        INITIAL_PRODUCTS.forEach(async p => {
-          // Avoid overwriting if it races, but setDoc merges by default? No, setDoc overwrites.
-          // Check existence? Too many reads.
-          // Just set state to INITIAL. Init DB only if truly needed. 
-          // For now, let's just set State.
-        });
-      }
-    }, (error) => {
-      console.error("Error watching products:", error);
-    });
+      if (docs.length > 0) setProducts(docs);
+      else setProducts(INITIAL_PRODUCTS);
+    }, (error) => console.error("Error watching products:", error));
 
     // Real-time: Listen for Locales
     const unsubLocales = onSnapshot(collection(db, 'locales'), (snapshot) => {
-      const docs = snapshot.docs.map(doc => {
-        const data = doc.data();
-        // Ensure inventory field exists to prevent crashes
-        return {
-          id: doc.id,
-          name: data.name || 'Sin nombre',
-          inventory: data.inventory || []
-        } as Locale;
-      });
+      const docs = snapshot.docs.map(doc => ({ id: doc.id, name: doc.data().name || 'Sin nombre', inventory: doc.data().inventory || [] } as Locale));
+      if (docs.length > 0) setLocales(docs);
+      else LOCALES.forEach(async l => await setDoc(doc(db, 'locales', l.id), l));
+    }, (error) => console.error("Error watching locales:", error));
 
-      if (docs.length > 0) {
-        setLocales(docs);
-      } else {
-        // Initialize if empty
-        LOCALES.forEach(async l => await setDoc(doc(db, 'locales', l.id), l));
-      }
-    }, (error) => {
-      console.error("Error watching locales:", error);
-    });
+    // Optimized: Fetch history with limit
+    let unsubTransfers = () => { };
 
-    // Optimized: Fetch more and sort in memory due to DD/MM/YYYY string format sorting issues
-    const qTransfers = query(collection(db, 'transfers'), limit(1000));
-    const unsubTransfers = onSnapshot(qTransfers, (snapshot) => {
-      const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Transfer));
+    // Check if any filter is active
+    const isFilterActive =
+      (historyFilterMode === 'date' && historySingleDate) ||
+      (historyFilterMode === 'range' && (historyFilterStart || historyFilterEnd)) ||
+      (historySearchTerm.trim().length > 0);
 
-      // Sort correctly by parsing DD/MM/YYYY
-      const sortedDocs = docs.sort((a, b) => {
-        if (!a.date || !b.date) return 0;
+    if (isFilterActive) {
+      const constraints: any[] = [orderBy('timestamp', 'desc'), limit(historyLimit)];
 
-        const parseDateTime = (str: string) => {
-          try {
-            const parts = str.split(',');
-            const datePart = parts[0].trim();
-            const timePart = parts[1]?.trim();
-            const [d, m, y] = datePart.split('/').map(Number);
-            if (timePart) {
-              const [hh, mm, ss] = timePart.split(':').map(Number);
-              return new Date(y, m - 1, d, hh, mm, ss).getTime();
-            }
-            return new Date(y, m - 1, d).getTime();
-          } catch (e) {
-            return 0;
-          }
-        };
-
-        const res = parseDateTime(b.date) - parseDateTime(a.date);
-        if (res !== 0) return res;
-
-        // Fallback to timestamp if available and dates are identical
-        if (a.timestamp && b.timestamp) {
-          try {
-            return b.timestamp.toMillis() - a.timestamp.toMillis();
-          } catch (e) {
-            return 0;
-          }
+      if (historyFilterMode === 'date' && historySingleDate) {
+        const [y, m, d] = historySingleDate.split('-').map(Number);
+        constraints.push(where('timestamp', '>=', Timestamp.fromDate(new Date(y, m - 1, d, 0, 0, 0))));
+        constraints.push(where('timestamp', '<=', Timestamp.fromDate(new Date(y, m - 1, d, 23, 59, 59))));
+      } else if (historyFilterMode === 'range' && (historyFilterStart || historyFilterEnd)) {
+        if (historyFilterStart) {
+          const [y, m, d] = historyFilterStart.split('-').map(Number);
+          constraints.push(where('timestamp', '>=', Timestamp.fromDate(new Date(y, m - 1, d, 0, 0, 0))));
         }
-        return 0;
-      });
+        if (historyFilterEnd) {
+          const [y, m, d] = historyFilterEnd.split('-').map(Number);
+          constraints.push(where('timestamp', '<=', Timestamp.fromDate(new Date(y, m - 1, d, 23, 59, 59))));
+        }
+      }
 
-      // Deduplicate by ID just in case
-      const uniqueDocs = Array.from(new Map(sortedDocs.map(item => [item.id, item])).values());
-      setTransfers(uniqueDocs);
-    });
+      const qTransfers = query(collection(db, 'transfers'), ...constraints);
+      unsubTransfers = onSnapshot(qTransfers, (snapshot) => {
+        const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Transfer));
+        const sortedDocs = docs.sort((a, b) => {
+          if (!a.date || !b.date) return 0;
+          const parseDateTime = (str: string) => {
+            try {
+              const parts = str.split(',');
+              const datePart = parts[0].trim();
+              const [d, m, y] = datePart.split('/').map(Number);
+              const timePart = parts[1]?.trim();
+              if (timePart) {
+                const [hh, mm, ss] = timePart.split(':').map(Number);
+                return new Date(y, m - 1, d, hh, mm, ss).getTime();
+              }
+              return new Date(y, m - 1, d).getTime();
+            } catch (e) { return 0; }
+          };
+          const res = parseDateTime(b.date) - parseDateTime(a.date);
+          if (res !== 0) return res;
+          if (a.timestamp && b.timestamp) return b.timestamp.toMillis() - a.timestamp.toMillis();
+          return 0;
+        });
+        setTransfers(Array.from(new Map(sortedDocs.map(item => [item.id, item])).values()));
+      }, (error) => console.error("Error fetching transfers:", error));
+    } else {
+      setTransfers([]);
+    }
 
-    // Sync custom categories from Firestore (Keep listener as it is low volume)
+    // Sync categories
     const unsubCategories = onSnapshot(doc(db, 'settings', 'categories'), (docSnap) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data();
-        if (data.customCategories && Array.isArray(data.customCategories)) {
-          setCustomCategories(data.customCategories);
-        }
+      if (docSnap.exists() && Array.isArray(docSnap.data().customCategories)) {
+        setCustomCategories(docSnap.data().customCategories);
       }
+    });
+
+    // Subscripción a estadísticas del dashboard
+    const unsubStats = onSnapshot(doc(db, 'settings', 'dashboard_stats'), (docSnap) => {
+      if (docSnap.exists()) setStats(docSnap.data());
     });
 
     return () => {
@@ -349,8 +352,9 @@ export default function App() {
       unsubLocales();
       unsubTransfers();
       unsubCategories();
+      unsubStats();
     };
-  }, [storageMode]);
+  }, [storageMode, historyLimit, historyFilterMode, historySingleDate, historyFilterStart, historyFilterEnd, historySearchTerm]);
 
 
 
@@ -430,10 +434,9 @@ export default function App() {
   const [isNewLocaleModalOpen, setIsNewLocaleModalOpen] = useState(false);
   const [isManageLocalesModalOpen, setIsManageLocalesModalOpen] = useState(false);
 
-  // Custom categories state
-  const [customCategories, setCustomCategories] = useState<string[]>([]);
   const [isNewCategoryModalOpen, setIsNewCategoryModalOpen] = useState(false);
   const [newCategoryName, setNewCategoryName] = useState('');
+  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
 
   const [selectedManagementCategory, setSelectedManagementCategory] = useState<string | null>(null);
 
@@ -475,8 +478,50 @@ export default function App() {
   const [showExpirationOnly, setShowExpirationOnly] = useState(false);
   const [trendInterval, setTrendInterval] = useState<'weekly' | 'monthly'>('monthly');
 
+  const updateDashboardStats = async (newTransfers: Transfer[], currentLocales: Locale[]) => {
+    if (storageMode !== 'cloud' || !newTransfers.length) return;
+
+    // This is a heavy operation, but we only do it on write
+    // In a real production app, this would be a Cloud Function
+    const distribution: { [key: string]: { name: string; value: number } } = {};
+    newTransfers.forEach(t => {
+      if (!t) return;
+      const name = t.productName || 'Unknown';
+      distribution[name] = { name, value: (distribution[name]?.value || 0) + t.quantity };
+    });
+
+    const destinationComparison = currentLocales.map(locale => {
+      const localeTransfers = newTransfers.filter(t => t.destinationLocaleId === locale.id);
+      return {
+        destino: locale.name,
+        total: localeTransfers.reduce((sum, t) => sum + t.quantity, 0),
+        movimientos: localeTransfers.length
+      };
+    });
+
+    const summary = {
+      distributionData: Object.values(distribution).sort((a, b) => b.value - a.value).slice(0, 8),
+      destinationComparison: destinationComparison.sort((a, b) => b.total - a.total),
+      lastUpdated: serverTimestamp()
+    };
+
+    try {
+      await setDoc(doc(db, 'settings', 'dashboard_stats'), summary, { merge: true });
+    } catch (e) {
+      console.error("Error updating stats:", e);
+    }
+  };
+
   // --- Analytics data processing ---
   const analyticsData = useMemo(() => {
+    if (storageMode === 'cloud' && stats) {
+      return {
+        ...stats,
+        // Trend data still calculated locally from what we have or placeholder
+        trendData: stats.trendData || [],
+        topProductsByDestination: stats.topProductsByDestination || []
+      };
+    }
     const safeTransfers = Array.isArray(transfers) ? transfers : [];
     const safeLocales = Array.isArray(locales) ? locales : [];
 
@@ -560,22 +605,6 @@ export default function App() {
   }, [transfers, locales, trendInterval]);
 
   const COLORS = ['#4F46E5', '#10B981', '#F59E0B', '#F43F5E', '#8B5CF6', '#06B6D4', '#EC4899', '#14B8A6'];
-
-  const [historyFilterStart, setHistoryFilterStart] = useState('');
-  const [historyFilterEnd, setHistoryFilterEnd] = useState('');
-  const [historyFilterLocale, setHistoryFilterLocale] = useState<string>('');
-  const [historyFilterMode, setHistoryFilterMode] = useState<'date' | 'range'>('date'); // 'date' | 'range'
-  const [historySearchTerm, setHistorySearchTerm] = useState('');
-
-  // Use local date for initial state to avoid UTC mismatch (e.g. late night shifting to tomorrow)
-  const getLocalToday = () => {
-    const now = new Date();
-    const year = now.getFullYear();
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const day = String(now.getDate()).padStart(2, '0');
-    return `${year}-${month}-${day}`;
-  };
-  const [historySingleDate, setHistorySingleDate] = useState(getLocalToday());
 
   // Load custom categories from localStorage (local mode) or wait for Firestore (cloud mode)
   useEffect(() => {
@@ -851,6 +880,10 @@ export default function App() {
             destLocaleData = { id: destLocaleDoc.id, ...destLocaleDoc.data() } as Locale;
           }
 
+          // Read Dashboard Stats
+          const statsRef = doc(db, 'settings', 'dashboard_stats');
+          const statsDoc = await transaction.get(statsRef);
+
           // 2. CHECK STOCK & VALIDATE
           if (editingTransferId) {
             throw new Error("La edición de transferencias no está soportada en esta versión optimizada.");
@@ -873,8 +906,7 @@ export default function App() {
 
           // 3. PERFORM UPDATES (Writes)
 
-          // Dedcut from Source
-          // Dedcut from Source
+          // Deduct from Source
           const isSourceExempt = sourceLocaleData && ['PRADERAS', 'DIQUE', 'SOHO', 'MARKET'].includes((sourceLocaleData.name || '').toUpperCase());
 
           if (sourceLocaleId === 'deposit') {
@@ -920,7 +952,40 @@ export default function App() {
             sourceLocaleName: sourceLocaleId === 'deposit' ? 'Depósito Central' : (sourceLocaleData?.name || 'Local'),
             timestamp: serverTimestamp()
           };
+
           transaction.set(newTransferRef, transferDocData);
+
+          // --- RECOMMENDATION 1: Update Dashboard Stats Document ---
+          let currentStats = statsDoc.exists() ? statsDoc.data() : {
+            distributionData: [],
+            destinationComparison: []
+          };
+
+          // Update Distribution
+          const distIdx = currentStats.distributionData.findIndex((d: any) => d.name === productData.name);
+          if (distIdx >= 0) {
+            currentStats.distributionData[distIdx].value += quantity;
+          } else {
+            currentStats.distributionData.push({ name: productData.name, value: quantity });
+          }
+          currentStats.distributionData.sort((a: any, b: any) => b.value - a.value);
+          currentStats.distributionData = currentStats.distributionData.slice(0, 15);
+
+          // Update Destination Comparison
+          const destName = localeId === 'deposit' ? 'Depósito Central' : (destLocaleData?.name || 'Desconocido');
+          const destIdx = currentStats.destinationComparison.findIndex((d: any) => d.destino === destName);
+          if (destIdx >= 0) {
+            currentStats.destinationComparison[destIdx].total += quantity;
+            currentStats.destinationComparison[destIdx].movimientos += 1;
+          } else {
+            currentStats.destinationComparison.push({ destino: destName, total: quantity, movimientos: 1 });
+          }
+          currentStats.destinationComparison.sort((a: any, b: any) => b.total - a.total);
+
+          transaction.set(statsRef, {
+            ...currentStats,
+            lastUpdated: serverTimestamp()
+          }, { merge: true });
         });
 
         // 4. UPDATE LOCAL STATE (Optimistic / Confirmation)
@@ -1106,7 +1171,7 @@ export default function App() {
         const exp = new Date(yExp, mExp - 1, dExp);
         const timeDiff = exp.getTime() - today.getTime();
         const daysDiff = Math.ceil(timeDiff / (1000 * 3600 * 24));
-        matches = matches && daysDiff <= 10;
+        matches = matches && daysDiff <= 30;
       }
     }
     return matches;
@@ -1800,35 +1865,14 @@ export default function App() {
 
         {/* Sidebar Footer */}
         <div className={`p-4 ${isSidebarCollapsed && !isMobileMenuOpen ? 'px-4' : 'px-6'} space-y-2`}>
-          {(!isSidebarCollapsed || isMobileMenuOpen) && (
-            <div className="space-y-2">
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  onClick={handleExportData}
-                  className="flex flex-col items-center justify-center p-2 rounded-xl bg-slate-800 text-xs font-bold text-slate-400 hover:text-white hover:bg-slate-700 transition-all group border border-slate-700/50"
-                  title="Exportar JSON"
-                >
-                  <Download className="w-4 h-4 mb-1" />
-                  <span>JSON</span>
-                </button>
-                <button
-                  onClick={handleExportProductsCSV}
-                  className="flex flex-col items-center justify-center p-2 rounded-xl bg-slate-800 text-xs font-bold text-slate-400 hover:text-white hover:bg-slate-700 transition-all group border border-slate-700/50"
-                  title="Exportar CSV"
-                >
-                  <FileText className="w-4 h-4 mb-1" />
-                  <span>CSV</span>
-                </button>
-              </div>
-
-              <label className="flex items-center justify-center gap-2 p-2 rounded-xl bg-indigo-600/10 text-xs font-bold text-indigo-400 hover:text-white hover:bg-indigo-600 transition-all cursor-pointer border border-indigo-500/20">
-                <Upload className="w-4 h-4" />
-                <span>Importar Datos</span>
-                <input type="file" accept=".json" onChange={handleImportData} className="hidden" />
-              </label>
-            </div>
-          )}
-
+          <button
+            onClick={() => setIsSettingsModalOpen(true)}
+            className={`w-full bg-slate-800 text-slate-400 hover:text-white hover:bg-slate-700 font-bold py-2.5 rounded-xl flex items-center justify-center transition-all border border-slate-700/50 ${isSidebarCollapsed && !isMobileMenuOpen ? '' : 'gap-2'}`}
+            title="Ajustes"
+          >
+            <Settings className="w-5 h-5" />
+            {(!isSidebarCollapsed || isMobileMenuOpen) && <span className="text-xs">Ajustes</span>}
+          </button>
 
           {deferredPrompt && (
             <button
@@ -1960,7 +2004,7 @@ export default function App() {
         <div className="space-y-6 md:space-y-10">
           {view === 'analytics' && (
             <div className="space-y-6 md:space-y-10">
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 md:gap-8">
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 md:gap-6">
                 <StatCard icon={<Package className="w-5 h-5 md:w-6 md:h-6" />} label="Maestro" value={totalItemsMaster} color="text-indigo-600" bgColor="bg-indigo-500" />
                 <StatCard icon={<Layers className="w-5 h-5 md:w-6 md:h-6" />} label="Destinos" value={locales.length} color="text-emerald-600" bgColor="bg-emerald-500" />
                 <StatCard
@@ -1969,7 +2013,23 @@ export default function App() {
                   value={products.filter(p => p.masterStock < 10).length}
                   color="text-rose-600"
                   bgColor="bg-rose-500"
-                  onClick={() => { setView('master'); setShowCriticalOnly(true); }}
+                  onClick={() => { setView('master'); setShowCriticalOnly(true); setShowExpirationOnly(false); }}
+                />
+                <StatCard
+                  icon={<AlertTriangle className="w-5 h-5 md:w-6 md:h-6" />}
+                  label="Por Vencer"
+                  value={products.filter(p => {
+                    if (!p.expirationDate) return false;
+                    const today = new Date();
+                    today.setHours(0, 0, 0, 0);
+                    const [y, m, d] = p.expirationDate.split('-').map(Number);
+                    const exp = new Date(y, m - 1, d);
+                    const daysDiff = Math.ceil((exp.getTime() - today.getTime()) / (1000 * 3600 * 24));
+                    return daysDiff <= 30;
+                  }).length}
+                  color="text-amber-600"
+                  bgColor="bg-amber-500"
+                  onClick={() => { setView('master'); setShowExpirationOnly(true); setShowCriticalOnly(false); }}
                 />
                 <StatCard
                   icon={<TrendingUp className="w-5 h-5 md:w-6 md:h-6" />}
@@ -2763,6 +2823,28 @@ export default function App() {
                     </button>
                   </div>
 
+                  <button
+                    onClick={() => {
+                      const end = new Date();
+                      const start = new Date();
+                      start.setDate(end.getDate() - 30);
+
+                      const formatDate = (d: Date) => {
+                        const year = d.getFullYear();
+                        const month = String(d.getMonth() + 1).padStart(2, '0');
+                        const day = String(d.getDate()).padStart(2, '0');
+                        return `${year}-${month}-${day}`;
+                      };
+
+                      setHistoryFilterMode('range');
+                      setHistoryFilterStart(formatDate(start));
+                      setHistoryFilterEnd(formatDate(end));
+                    }}
+                    className="px-4 py-1.5 bg-indigo-50 text-indigo-600 rounded-xl font-bold text-[10px] uppercase hover:bg-indigo-100 transition-colors border border-indigo-100/50 order-2"
+                  >
+                    Ver Últimos 30 Días
+                  </button>
+
                   <div className="h-8 w-px bg-slate-100 hidden md:block mx-1 order-2"></div>
 
                   {/* Search Input */}
@@ -3035,6 +3117,18 @@ export default function App() {
                   );
                 });
               })()}
+
+              {storageMode === 'cloud' && transfers.length >= historyLimit && (
+                <div className="flex justify-center pt-4">
+                  <button
+                    onClick={() => setHistoryLimit(prev => prev + 30)}
+                    className="px-6 py-3 bg-white border border-slate-200 text-indigo-600 font-black text-xs uppercase tracking-widest rounded-2xl hover:bg-slate-50 transition-all shadow-sm flex items-center gap-2"
+                  >
+                    <Plus className="w-4 h-4" />
+                    Cargar más movimientos
+                  </button>
+                </div>
+              )}
             </div>
           )}
 
@@ -3169,47 +3263,12 @@ export default function App() {
 
 
               <div className="mt-8 pt-8 border-t border-slate-100">
-                <h4 className="text-sm font-black text-slate-900 mb-4 flex items-center">
-                  <Settings className="w-4 h-4 mr-2 text-indigo-500" /> Datos
-                </h4>
-                <div className="grid grid-cols-2 gap-4">
-
-                  <button
-                    onClick={handleExportData}
-                    className="p-4 rounded-2xl bg-indigo-50 text-indigo-600 font-bold text-sm flex flex-col items-center justify-center gap-2"
-                  >
-                    <Download className="w-5 h-5" />
-                    Exportar JSON
-                  </button>
-                  <button
-                    onClick={handleExportProductsCSV}
-                    className="p-4 rounded-2xl bg-teal-50 text-teal-600 font-bold text-sm flex flex-col items-center justify-center gap-2"
-                  >
-                    <Download className="w-5 h-5" />
-                    Exportar CSV
-                  </button>
-                  <label className="p-4 rounded-2xl bg-indigo-50 text-indigo-600 font-bold text-sm flex flex-col items-center justify-center gap-2 cursor-pointer">
-                    <Upload className="w-5 h-5" />
-                    Importar
-                    <input type="file" accept=".json" onChange={handleImportData} className="hidden" />
-                  </label>
-                </div>
-
-                <label className="mt-4 w-full p-4 rounded-2xl bg-emerald-50 text-emerald-600 font-bold text-sm flex items-center justify-center gap-2 cursor-pointer border border-emerald-100/50 hover:bg-emerald-100 transition-colors shadow-sm">
-                  <Upload className="w-5 h-5" />
-                  <span>Importar Productos CSV</span>
-                  <input type="file" accept=".csv" onChange={handleImportProductsCSV} className="hidden" />
-                </label>
                 <button
-                  onClick={() => {
-                    if (window.confirm("¿Cambiar modo de almacenamiento?")) {
-                      localStorage.removeItem('storage_preference');
-                      window.location.reload();
-                    }
-                  }}
-                  className="w-full mt-4 p-4 rounded-2xl bg-slate-100 text-slate-500 font-bold text-xs uppercase tracking-widest hover:bg-slate-200 transition-colors"
+                  onClick={() => { setIsSettingsModalOpen(true); setIsMobileMenuOpen(false); }}
+                  className="w-full p-4 rounded-2xl bg-slate-50 text-slate-700 font-bold text-sm flex items-center justify-center gap-3 border border-slate-100 hover:bg-slate-100 transition-colors"
                 >
-                  Cambiar Modo ({storageMode === 'cloud' ? 'Nube' : 'Local'})
+                  <Settings className="w-5 h-5 text-indigo-500" />
+                  Ajustes y Datos
                 </button>
               </div>
 
@@ -3759,6 +3818,113 @@ export default function App() {
                   </div>
                 )}
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Settings Modal */}
+      {isSettingsModalOpen && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 animate-in fade-in duration-300">
+          <div className="absolute inset-0 bg-slate-900/50 backdrop-blur-sm" onClick={() => setIsSettingsModalOpen(false)} />
+          <div className="relative bg-white rounded-[2rem] w-full max-w-lg shadow-2xl animate-in zoom-in-95 slide-in-from-bottom-4 duration-500 max-h-[90vh] overflow-y-auto">
+            {/* Header */}
+            <div className="sticky top-0 bg-white/95 backdrop-blur-xl rounded-t-[2rem] px-8 py-6 border-b border-slate-100 flex items-center justify-between z-10">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-indigo-100 flex items-center justify-center">
+                  <Settings className="w-5 h-5 text-indigo-600" />
+                </div>
+                <h2 className="text-xl font-black text-slate-900">Ajustes</h2>
+              </div>
+              <button
+                onClick={() => setIsSettingsModalOpen(false)}
+                className="w-10 h-10 flex items-center justify-center bg-slate-100 rounded-full text-slate-500 hover:bg-slate-200 hover:text-slate-700 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-8 space-y-8">
+              {/* Storage Mode Section */}
+              <div>
+                <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">Modo de Almacenamiento</h4>
+                <div className="p-4 rounded-2xl bg-slate-50 border border-slate-100 flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${storageMode === 'cloud' ? 'bg-violet-100 text-violet-600' : 'bg-slate-200 text-slate-600'}`}>
+                      {storageMode === 'cloud' ? <Cloud className="w-5 h-5" /> : <Smartphone className="w-5 h-5" />}
+                    </div>
+                    <div>
+                      <p className="text-sm font-bold text-slate-900">{storageMode === 'cloud' ? 'Nube (Online)' : 'Memoria Local'}</p>
+                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                        {storageMode === 'cloud' ? 'Sincronización en tiempo real' : 'Solo en este dispositivo'}
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => {
+                      if (window.confirm('¿Cambiar modo de almacenamiento? La página se recargará.')) {
+                        localStorage.removeItem('storage_preference');
+                        window.location.reload();
+                      }
+                    }}
+                    className="px-4 py-2 rounded-xl bg-white border border-slate-200 text-xs font-bold text-slate-600 hover:bg-indigo-50 hover:text-indigo-600 hover:border-indigo-200 transition-all"
+                  >
+                    Cambiar
+                  </button>
+                </div>
+              </div>
+
+              {/* Export Section */}
+              <div>
+                <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">Exportar Datos</h4>
+                <div className="grid grid-cols-2 gap-3">
+                  <button
+                    onClick={() => { handleExportData(); setIsSettingsModalOpen(false); }}
+                    className="p-4 rounded-2xl bg-indigo-50 text-indigo-600 font-bold text-sm flex flex-col items-center justify-center gap-2 hover:bg-indigo-100 transition-colors border border-indigo-100/50"
+                  >
+                    <Download className="w-5 h-5" />
+                    Exportar JSON
+                  </button>
+                  <button
+                    onClick={() => { handleExportProductsCSV(); setIsSettingsModalOpen(false); }}
+                    className="p-4 rounded-2xl bg-teal-50 text-teal-600 font-bold text-sm flex flex-col items-center justify-center gap-2 hover:bg-teal-100 transition-colors border border-teal-100/50"
+                  >
+                    <FileText className="w-5 h-5" />
+                    Exportar CSV
+                  </button>
+                </div>
+              </div>
+
+              {/* Import Section */}
+              <div>
+                <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">Importar Datos</h4>
+                <div className="space-y-3">
+                  <label className="w-full p-4 rounded-2xl bg-indigo-50 text-indigo-600 font-bold text-sm flex items-center justify-center gap-2 cursor-pointer hover:bg-indigo-100 transition-colors border border-indigo-100/50">
+                    <Upload className="w-5 h-5" />
+                    <span>Importar JSON</span>
+                    <input type="file" accept=".json" onChange={(e) => { handleImportData(e); setIsSettingsModalOpen(false); }} className="hidden" />
+                  </label>
+                  <label className="w-full p-4 rounded-2xl bg-emerald-50 text-emerald-600 font-bold text-sm flex items-center justify-center gap-2 cursor-pointer hover:bg-emerald-100 transition-colors border border-emerald-100/50">
+                    <Upload className="w-5 h-5" />
+                    <span>Importar Productos CSV</span>
+                    <input type="file" accept=".csv" onChange={(e) => { handleImportProductsCSV(e); setIsSettingsModalOpen(false); }} className="hidden" />
+                  </label>
+                </div>
+              </div>
+
+              {/* Install App */}
+              {deferredPrompt && (
+                <div>
+                  <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">Aplicación</h4>
+                  <button
+                    onClick={() => { handleInstallClick(); setIsSettingsModalOpen(false); }}
+                    className="w-full p-4 rounded-2xl bg-indigo-600 text-white font-bold text-sm flex items-center justify-center gap-2 hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-200"
+                  >
+                    <Laptop className="w-5 h-5" />
+                    Instalar Aplicación
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </div>
