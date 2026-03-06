@@ -129,7 +129,7 @@ const BottomNavItem: React.FC<{
 );
 
 const Card: React.FC<{ title?: string; children: React.ReactNode; className?: string; noPadding?: boolean; headerAction?: React.ReactNode }> = ({ title, children, className, noPadding, headerAction }) => (
-  <div className={`bg-white rounded-3xl md:rounded-[2rem] shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-100 overflow-hidden transition-all ${className}`}>
+  <div className={`bg-white rounded-3xl md:rounded-[2rem] shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-100 transition-all ${className}`}>
     {(title || headerAction) && (
       <div className="px-6 md:px-8 py-5 md:py-6 border-b border-slate-50 flex items-center justify-between">
         {title && <h3 className="text-base md:text-lg font-bold text-slate-800">{title}</h3>}
@@ -168,16 +168,19 @@ const StatCard: React.FC<{ icon: React.ReactNode; label: string; value: string |
 
 // --- Helper Functions ---
 
+const normalizeText = (text: string) =>
+  text.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim();
+
 const matchesSearch = (product: Product, term: string) => {
   if (!term) return true;
-  const t = term.toLowerCase().trim();
-  const name = product.name ? product.name.toLowerCase() : '';
-  const sku = product.sku ? product.sku.toLowerCase() : '';
+  const t = normalizeText(term);
+  const name = product.name ? normalizeText(product.name) : '';
+  const sku = product.sku ? normalizeText(product.sku) : '';
 
   return (
     name.includes(t) ||
     sku.includes(t) ||
-    product.additionalSkus?.some(ask => ask && ask.toLowerCase().includes(t)) || false
+    product.additionalSkus?.some(ask => ask && normalizeText(ask).includes(t)) || false
   );
 };
 
@@ -192,15 +195,9 @@ const getFilteredTransferProducts = (products: Product[], term: string, category
       return category === 'all' || p.category === category;
     }
 
-    // 3. If term is present:
-    //    - If it's an EXACT SKU/AdditionalSKU match, BYPASS category filter (User expectation: "I scanned it, I want it")
-    const cleanTerm = term.trim().toUpperCase();
-    const isStrongMatch = p.sku === cleanTerm || p.additionalSkus?.some(ask => ask === cleanTerm);
-
-    if (isStrongMatch) return true;
-
-    //    - Otherwise, respect category filter
-    return category === 'all' || p.category === category;
+    // 3. If the user is actively searching by text, show ALL matching products
+    //    regardless of category. The user typed a name — they want to find it.
+    return true;
   });
 };
 
@@ -889,7 +886,8 @@ export default function App() {
             throw new Error("La edición de transferencias no está soportada en esta versión optimizada.");
           }
 
-          // Check Source Stock
+          // Check Source Stock - DISABLED based on user request to allow movements regardless of system stock
+          /*
           if (sourceLocaleId === 'deposit') {
             if (productData.masterStock < quantity) {
               throw new Error(`Stock insuficiente en Depósito Central. Disponible: ${productData.masterStock}`);
@@ -903,6 +901,7 @@ export default function App() {
               throw new Error(`Stock insuficiente en ${sourceLocaleData?.name}. Disponible: ${currentStock}`);
             }
           }
+          */
 
           // 3. PERFORM UPDATES (Writes)
 
@@ -913,9 +912,16 @@ export default function App() {
             transaction.update(productRef, { masterStock: productData.masterStock - quantity });
           } else if (!isSourceExempt) {
             if (!sourceLocaleData) throw new Error("Error interno: Datos de origen perdidos");
-            const newInventory = sourceLocaleData.inventory.map(item =>
-              item.productId === productId ? { ...item, stock: item.stock - quantity } : item
-            );
+
+            const hasItem = sourceLocaleData.inventory?.some(i => i.productId === productId) ?? false;
+            let newInventory;
+            if (hasItem) {
+              newInventory = sourceLocaleData.inventory.map(item =>
+                item.productId === productId ? { ...item, stock: item.stock - quantity } : item
+              );
+            } else {
+              newInventory = [...(sourceLocaleData.inventory || []), { productId, stock: -quantity }];
+            }
             transaction.update(doc(db, 'locales', sourceLocaleId), { inventory: newInventory });
           }
 
@@ -994,12 +1000,17 @@ export default function App() {
         // For simplicity with listeners active:
         setIsTransferModalOpen(false);
         setIsSubmitting(false);
+        // Reset transfer form for next use
+        setTransferCategoryFilter('all');
+        setTransferSearchTerm('');
+        setTransferData({ productId: '', localeId: '', sourceLocaleId: 'deposit', quantity: 0 });
         alert("Movimiento ejecutado");
 
       } else {
         // LOCAL MODE LOGIC
         // ... (existing local logic would be here, but let's assume Cloud for now as per user context usually)
-        // Check Source Stock
+        // Check Source Stock - DISABLED based on user request
+        /*
         const sourceProduct = products.find(p => p.id === productId);
         if (!sourceProduct) return; // Should not happen
 
@@ -1020,6 +1031,7 @@ export default function App() {
             return;
           }
         }
+        */
 
         // Update State manually
         setProducts(prev => prev.map(p =>
@@ -1032,7 +1044,13 @@ export default function App() {
           // Deduct from source
           if (l.id === sourceLocaleId) {
             if (['PRADERAS', 'DIQUE', 'SOHO', 'MARKET'].includes((l.name || '').toUpperCase())) return l;
-            return { ...l, inventory: l.inventory.map(i => i.productId === productId ? { ...i, stock: i.stock - quantity } : i) };
+
+            const hasItem = l.inventory?.some(i => i.productId === productId) ?? false;
+            return {
+              ...l, inventory: hasItem
+                ? l.inventory.map(i => i.productId === productId ? { ...i, stock: i.stock - quantity } : i)
+                : [...(l.inventory || []), { productId, stock: -quantity }]
+            };
           }
           // Add to dest
           if (l.id === localeId) {
@@ -1061,6 +1079,10 @@ export default function App() {
         setTransfers(prev => [newTransfer, ...prev]);
         setIsTransferModalOpen(false);
         setIsSubmitting(false);
+        // Reset transfer form for next use
+        setTransferCategoryFilter('all');
+        setTransferSearchTerm('');
+        setTransferData({ productId: '', localeId: '', sourceLocaleId: 'deposit', quantity: 0 });
       }
     } catch (err: any) {
       console.error(err);
@@ -3464,7 +3486,7 @@ export default function App() {
 
                     {/* Autocomplete Suggestions */}
                     {showTransferSuggestions && (
-                      <div className="absolute z-50 w-full mt-1 bg-white border border-slate-200 rounded-2xl shadow-2xl max-h-60 overflow-y-auto custom-scrollbar left-0">
+                      <div className="z-50 w-full mt-1 bg-white border border-slate-200 rounded-2xl shadow-2xl max-h-60 overflow-y-auto custom-scrollbar">
                         {getFilteredTransferProducts(products, transferSearchTerm, transferCategoryFilter).length > 0 ? (
                           getFilteredTransferProducts(products, transferSearchTerm, transferCategoryFilter)
                             .map(p => (
